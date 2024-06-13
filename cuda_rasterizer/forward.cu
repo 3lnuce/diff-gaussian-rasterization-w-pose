@@ -410,7 +410,8 @@ renderCUDAFast(
 	const float* __restrict__ depth,
 	float* __restrict__ out_depth,
 	float* __restrict__ out_opacity,
-	int * __restrict__ n_touched)
+	int * __restrict__ n_touched,
+	int * __restrict__ tile_active)
 {
 	// Identify current tile and associated min/max pixel range.
 	auto block = cg::this_thread_block();
@@ -429,8 +430,14 @@ renderCUDAFast(
 	// Done threads can help with fetching, but don't rasterize
 	bool done = !inside;
 
-	// if (pix_min.x % 32 == 0 && pix_min.y % 32 == 0)
+	// uint32_t tile_idx = block.group_index().y * gridDim.x + block.group_index().x;
+	// printf ("debug tile_id: %d, %d, %d\n", block.group_index().x, block.group_index().y, tile_idx);
+
+	// if (tile_active[tile_idx] == 0)
+	// {
+	// 	// printf("wrong tile %d - %d - %d!!!\n", block.group_index().y, block.group_index().x, tile_idx);
 	// 	done = true;
+	// }
 
 	// if (pix_min.x % 32 == 0)// && pix_min.y % 32 == 0)
 	// 	done = true;
@@ -586,7 +593,8 @@ void FORWARD::render_fast(
 	const float* depth,
 	float* out_depth,
 	float* out_opacity,
-	int* n_touched)
+	int* n_touched,
+	int* tile_active)
 {
 	renderCUDAFast<NUM_CHANNELS> << <grid, block >> > (
 		ranges,
@@ -602,7 +610,8 @@ void FORWARD::render_fast(
 		depth,
 		out_depth,
 		out_opacity,
-		n_touched);
+		n_touched,
+		tile_active);
 }
 
 void FORWARD::preprocess(int P, int D, int M,

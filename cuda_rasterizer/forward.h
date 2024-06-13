@@ -61,7 +61,7 @@ namespace FORWARD
 		const float* bg_color,
 		float* out_color,
 		const float* depth,
-	    float* out_depth,
+		float* out_depth,
 		float* out_opacity,
 		int* n_touched);
 
@@ -79,9 +79,10 @@ namespace FORWARD
 		const float* bg_color,
 		float* out_color,
 		const float* depth,
-	    float* out_depth,
+		float* out_depth,
 		float* out_opacity,
-		int* n_touched);
+		int* n_touched,
+		int* tile_active);
 }
 
 

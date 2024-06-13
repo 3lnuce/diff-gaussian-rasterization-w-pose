@@ -91,10 +91,10 @@ RasterizeGaussiansCUDA(
       }
 
 	  rendered = CudaRasterizer::Rasterizer::forward(
-	    geomFunc,
+		geomFunc,
 		binningFunc,
 		imgFunc,
-	    P, degree, M,
+		P, degree, M,
 		background.contiguous().data<float>(),
 		W, H,
 		means3D.contiguous().data<float>(),
@@ -116,7 +116,7 @@ RasterizeGaussiansCUDA(
 		out_opaticy.contiguous().data<float>(),
 		radii.contiguous().data<int>(),
 		n_touched.contiguous().data<int>(),
-        debug);
+		debug);
   }
   return std::make_tuple(rendered, out_color, radii, geomBuffer, binningBuffer, imgBuffer, out_depth, out_opaticy, n_touched);
 }
@@ -125,24 +125,25 @@ std::tuple<int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torc
 RasterizeGaussiansCUDAFast(
 	const torch::Tensor& background,
 	const torch::Tensor& means3D,
-    const torch::Tensor& colors,
-    const torch::Tensor& opacity,
+	const torch::Tensor& colors,
+	const torch::Tensor& opacity,
 	const torch::Tensor& scales,
 	const torch::Tensor& rotations,
 	const float scale_modifier,
 	const torch::Tensor& cov3D_precomp,
 	const torch::Tensor& viewmatrix,
 	const torch::Tensor& projmatrix,
-    const torch::Tensor& projmatrix_raw,
-    const float tan_fovx,
+	const torch::Tensor& projmatrix_raw,
+	const float tan_fovx,
 	const float tan_fovy,
-    const int image_height,
-    const int image_width,
+	const int image_height,
+	const int image_width,
 	const torch::Tensor& sh,
 	const int degree,
 	const torch::Tensor& campos,
 	const bool prefiltered,
-	const bool debug)
+	const bool debug,
+	const torch::Tensor& is_active)
 {
   if (means3D.ndimension() != 2 || means3D.size(1) != 3) {
     AT_ERROR("means3D must have dimensions (num_points, 3)");
@@ -170,6 +171,10 @@ RasterizeGaussiansCUDAFast(
   std::function<char*(size_t)> binningFunc = resizeFunctional(binningBuffer);
   std::function<char*(size_t)> imgFunc = resizeFunctional(imgBuffer);
 
+  uint32_t hori_blocks = (W + BLOCK_X - 1) / BLOCK_X;
+  uint32_t vert_blocks = (H + BLOCK_Y - 1) / BLOCK_Y;
+  torch::Tensor tile_active = torch::full({hori_blocks * vert_blocks}, 0, means3D.options().dtype(torch::kInt32));
+
   int rendered = 0;
   if(P != 0)
   {
@@ -180,10 +185,10 @@ RasterizeGaussiansCUDAFast(
       }
 
 	  rendered = CudaRasterizer::Rasterizer::forward_fast(
-	    geomFunc,
+		geomFunc,
 		binningFunc,
 		imgFunc,
-	    P, degree, M,
+		P, degree, M,
 		background.contiguous().data<float>(),
 		W, H,
 		means3D.contiguous().data<float>(),
@@ -205,7 +210,9 @@ RasterizeGaussiansCUDAFast(
 		out_opaticy.contiguous().data<float>(),
 		radii.contiguous().data<int>(),
 		n_touched.contiguous().data<int>(),
-        debug);
+		debug,
+		is_active.contiguous().data<int>(),
+		tile_active.contiguous().data<int>());
   }
   return std::make_tuple(rendered, out_color, radii, geomBuffer, binningBuffer, imgBuffer, out_depth, out_opaticy, n_touched);
 }

@@ -30,6 +30,8 @@ namespace cg = cooperative_groups;
 #include "forward.h"
 #include "backward.h"
 
+#include <torch/extension.h>
+
 // Helper function to find the next-highest bit of the MSB
 // on the CPU.
 uint32_t getHigherMsb(uint32_t n)
@@ -63,6 +65,69 @@ __global__ void checkFrustum(int P,
 
 	float3 p_view;
 	present[idx] = in_frustum(idx, orig_points, viewmatrix, projmatrix, false, p_view);
+}
+
+// Generates one key/value pair for all Gaussian / tile overlaps.
+// Run once per Gaussian (1:N mapping).
+__global__ void duplicateWithKeysFast(
+	int P,
+	const float2* points_xy,
+	const float* depths,
+	const uint32_t* offsets,
+	uint64_t* gaussian_keys_unsorted,
+	uint32_t* gaussian_values_unsorted,
+	int* radii,
+	dim3 grid,
+	const int* is_active,
+	int* tile_active,
+	int* tile_touched_active)
+{
+	auto idx = cg::this_grid().thread_rank();
+	if (idx >= P)
+		return;
+
+	// Generate no key/value pair for invisible Gaussians
+	if (radii[idx] > 0)
+	{
+		// Find this Gaussian's offset in buffer for writing keys/values.
+		uint32_t off = (idx == 0) ? 0 : offsets[idx - 1];
+		uint2 rect_min, rect_max;
+
+		getRect(points_xy[idx], radii[idx], rect_min, rect_max, grid);
+
+		// For each tile that the bounding rect overlaps, emit a
+		// key/value pair. The key is |  tile ID  |      depth      |,
+		// and the value is the ID of the Gaussian. Sorting the values
+		// with this key yields Gaussian IDs in a list, such that they
+		// are first sorted by tile and then by depth.
+		for (int y = rect_min.y; y < rect_max.y; y++)
+		{
+			for (int x = rect_min.x; x < rect_max.x; x++)
+			{
+				uint64_t key = y * grid.x + x;
+				// printf ("before: %d - %d/%d - %d\n", grid.x, x, y, key);
+				// printf ("before: %d/%d - %d\n", x, y, key);
+
+				// if (is_active[idx] == 1)
+				// {
+				// 	tile_active[key] = 1;
+				// 	// printf("valid_tile: %d\n", key);
+				// }
+
+				// if (is_active[idx] == 0)
+				// 	printf("wrong_tile !!!\n");
+				key <<= 32;
+				key |= *((uint32_t*)&depths[idx]);
+				gaussian_keys_unsorted[off] = key;
+				gaussian_values_unsorted[off] = idx;
+				off++;
+				// printf ("after: %d - %d/%d - %d\n", grid.x, x, y, key);
+				// printf ("after: %d/%d - %d\n", x, y, key);
+			}
+		}
+		// if (is_active[idx] == 1)
+		// 	tile_touched_active[idx] = (rect_max.y - rect_min.y) * (rect_max.x - rect_min.x);
+	}
 }
 
 // Generates one key/value pair for all Gaussian / tile overlaps.
@@ -370,7 +435,9 @@ int CudaRasterizer::Rasterizer::forward_fast(
 	float* out_opacity,
 	int* radii,
 	int* n_touched,
-	bool debug)
+	bool debug,
+	const int* is_active,
+	int* tile_active)
 {
 	const float focal_y = height / (2.0f * tan_fovy);
 	const float focal_x = width / (2.0f * tan_fovx);
@@ -437,9 +504,12 @@ int CudaRasterizer::Rasterizer::forward_fast(
 	char* binning_chunkptr = binningBuffer(binning_chunk_size);
 	BinningState binningState = BinningState::fromChunk(binning_chunkptr, num_rendered);
 
+	torch::Tensor tile_touched_active_mem = torch::full({P}, 0, torch::kInt32).to(torch::kCUDA);
+	int* tile_touched_active = tile_touched_active_mem.contiguous().data<int>();
+
 	// For each instance to be rendered, produce adequate [ tile | depth ] key
 	// and corresponding dublicated Gaussian indices to be sorted
-	duplicateWithKeys << <(P + 255) / 256, 256 >> > (
+	duplicateWithKeysFast << <(P + 255) / 256, 256 >> > (
 		P,
 		geomState.means2D,
 		geomState.depths,
@@ -447,8 +517,45 @@ int CudaRasterizer::Rasterizer::forward_fast(
 		binningState.point_list_keys_unsorted,
 		binningState.point_list_unsorted,
 		radii,
-		tile_grid)
+		tile_grid,
+		is_active,
+		tile_active,
+		tile_touched_active)
 	CHECK_CUDA(, debug)
+
+	/* dump touched tile */
+	// int tile_touched_active_cpu[P];
+	// cudaMemcpy(tile_touched_active_cpu, tile_touched_active, P * sizeof(int), cudaMemcpyDeviceToHost);
+	// printf ("Begin_of_dump_touched_tile\n");
+	// for (int idx=0; idx<P; idx++)
+	// 	printf ("idx: %d, val: %d\n", idx, tile_touched_active_cpu[idx]);
+	// cudaDeviceSynchronize();
+	// printf ("End_of_dump_touched_tile\n");
+	// cudaDeviceSynchronize();
+
+	/* dump active tile */
+	// int tile_active_cpu[3225];
+	// cudaMemcpy(tile_active_cpu, tile_active, 3225 * sizeof(int), cudaMemcpyDeviceToHost);
+	// cudaDeviceSynchronize();
+	// int total = 0;
+	// printf ("sum_host: %d\n", total);
+
+	// printf ("Begin_of_dump_active_tile\n");
+	// for (int j=0; j<43; j++)
+	// {
+	// 	for (int i=0; i<75; i++)
+	// 	{
+	// 		int temp_idx = j * 75 + i;
+	// 		printf("col: %d, row: %d, tile: %d, val: %d\n", i, j, temp_idx, tile_active_cpu[temp_idx]);
+	// 		total += tile_active_cpu[temp_idx];
+	// 	}
+	// }
+
+	// printf ("End_of_dump_active_tile\n");
+	// printf ("sum_host: %d\n", total);
+
+	// cudaDeviceSynchronize();
+
 
 	int bit = getHigherMsb(tile_grid.x * tile_grid.y);
 
@@ -487,7 +594,8 @@ int CudaRasterizer::Rasterizer::forward_fast(
 		geomState.depths,
 		out_depth,
 		out_opacity,
-		n_touched
+		n_touched,
+		tile_active
     ), debug)
 
 	return num_rendered;

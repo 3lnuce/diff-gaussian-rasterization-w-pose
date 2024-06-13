@@ -57,6 +57,7 @@ def rasterize_gaussians_fast(
     theta,
     rho,
     raster_settings,
+    is_active,
 ):
     return _RasterizeGaussiansFast.apply(
         means3D,
@@ -70,6 +71,7 @@ def rasterize_gaussians_fast(
         theta,
         rho,
         raster_settings,
+        is_active,
     )
 
 
@@ -213,6 +215,7 @@ class _RasterizeGaussiansFast(torch.autograd.Function):
         theta,
         rho,
         raster_settings,
+        is_active,
     ):
 
         # Restructure arguments the way that the C++ lib expects them
@@ -237,6 +240,7 @@ class _RasterizeGaussiansFast(torch.autograd.Function):
             raster_settings.campos,
             raster_settings.prefiltered,
             raster_settings.debug,
+            is_active,
         )
 
         # Invoke C++/CUDA rasterizer
@@ -319,6 +323,7 @@ class _RasterizeGaussiansFast(torch.autograd.Function):
             grad_cov3Ds_precomp,
             grad_theta,
             grad_rho,
+            None,
             None,
         )
 
@@ -413,7 +418,7 @@ class GaussianRasterizerFast(nn.Module):
 
         return visible
 
-    def forward(self, means3D, means2D, opacities, shs = None, colors_precomp = None, scales = None, rotations = None, cov3D_precomp = None, theta=None, rho=None):
+    def forward(self, means3D, means2D, opacities, shs = None, colors_precomp = None, scales = None, rotations = None, cov3D_precomp = None, theta=None, rho=None, is_active=None):
 
         raster_settings = self.raster_settings
 
@@ -438,6 +443,8 @@ class GaussianRasterizerFast(nn.Module):
             theta = torch.Tensor([])
         if rho is None:
             rho = torch.Tensor([])
+        if is_active is None:
+            is_active = torch.Tensor([])
 
 
         # Invoke C++/CUDA rasterization routine
@@ -453,4 +460,5 @@ class GaussianRasterizerFast(nn.Module):
             theta,
             rho,
             raster_settings,
+            is_active,
         )

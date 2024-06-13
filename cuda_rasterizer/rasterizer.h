@@ -80,7 +80,9 @@ namespace CudaRasterizer
 			float* out_opacity,
 			int* radii = nullptr,
 			int* n_touched = nullptr,
-			bool debug = false);
+			bool debug = false,
+			const int* is_active = nullptr,
+			int* tile_active = nullptr);
 
 		static void backward(
 			const int P, int D, int M, int R,
