@@ -17,6 +17,8 @@
 #include <cooperative_groups/reduce.h>
 namespace cg = cooperative_groups;
 
+// #define USE_LIST
+
 // Forward method for converting the input spherical harmonics
 // coefficients of each Gaussian to a simple RGB color.
 __device__ glm::vec3 computeColorFromSH(int idx, int deg, int max_coeffs, const glm::vec3* means, glm::vec3 campos, const float* shs, bool* clamped)
@@ -411,13 +413,27 @@ renderCUDAFast(
 	float* __restrict__ out_depth,
 	float* __restrict__ out_opacity,
 	int * __restrict__ n_touched,
-	int * __restrict__ tile_active)
+	int * __restrict__ tile_active,
+	int * __restrict__ tile_active_list)
 {
 	// Identify current tile and associated min/max pixel range.
 	auto block = cg::this_thread_block();
 	uint32_t horizontal_blocks = (W + BLOCK_X - 1) / BLOCK_X;
 	// uint32_t horizontal_blocks = gridDim.x; # TODO Maybe it's different?
-	uint2 pix_min = { block.group_index().x * BLOCK_X, block.group_index().y * BLOCK_Y };
+
+#ifdef USE_LIST
+	uint32_t tile_idx = tile_active_list[block.group_index().x];
+	int block_coord_y = tile_idx / horizontal_blocks;
+	int block_coord_x = tile_idx % horizontal_blocks;
+#else
+	uint32_t tile_idx = block.group_index().y * gridDim.x + block.group_index().x;
+	int block_coord_x = block.group_index().x;
+	int block_coord_y = block.group_index().y;
+	if (tile_active[tile_idx] == 0)
+		return;
+#endif
+
+	uint2 pix_min = { block_coord_x * BLOCK_X, block_coord_y * BLOCK_Y };
 	uint2 pix_max = { min(pix_min.x + BLOCK_X, W), min(pix_min.y + BLOCK_Y , H) };
 	uint2 pix = { pix_min.x + block.thread_index().x, pix_min.y + block.thread_index().y };
 	uint32_t pix_id = W * pix.y + pix.x;
@@ -443,7 +459,7 @@ renderCUDAFast(
 	// 	done = true;
 
 	// Load start/end range of IDs to process in bit sorted list.
-	uint2 range = ranges[block.group_index().y * horizontal_blocks + block.group_index().x];
+	uint2 range = ranges[block_coord_y * horizontal_blocks + block_coord_x];
 	const int rounds = ((range.y - range.x + BLOCK_SIZE - 1) / BLOCK_SIZE);
 	int toDo = range.y - range.x;
 
@@ -594,9 +610,16 @@ void FORWARD::render_fast(
 	float* out_depth,
 	float* out_opacity,
 	int* n_touched,
-	int* tile_active)
+	int* tile_active,
+	const int active_count,
+	int* tile_active_list)
 {
+#ifdef USE_LIST
+	dim3 grid1d(active_count, 1, 1);
+	renderCUDAFast<NUM_CHANNELS> << <grid1d, block >> > (
+#else
 	renderCUDAFast<NUM_CHANNELS> << <grid, block >> > (
+#endif
 		ranges,
 		point_list,
 		W, H,
@@ -611,7 +634,8 @@ void FORWARD::render_fast(
 		out_depth,
 		out_opacity,
 		n_touched,
-		tile_active);
+		tile_active,
+		tile_active_list);
 }
 
 void FORWARD::preprocess(int P, int D, int M,

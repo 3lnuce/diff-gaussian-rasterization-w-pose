@@ -32,6 +32,8 @@ namespace cg = cooperative_groups;
 
 #include <torch/extension.h>
 
+#define TIMING
+
 // Helper function to find the next-highest bit of the MSB
 // on the CPU.
 uint32_t getHigherMsb(uint32_t n)
@@ -108,11 +110,11 @@ __global__ void duplicateWithKeysFast(
 				// printf ("before: %d - %d/%d - %d\n", grid.x, x, y, key);
 				// printf ("before: %d/%d - %d\n", x, y, key);
 
-				// if (is_active[idx] == 1)
-				// {
-				// 	tile_active[key] = 1;
-				// 	// printf("valid_tile: %d\n", key);
-				// }
+				if (is_active[idx] == 1)
+				{
+					tile_active[key] = 1;
+					// printf("valid_tile: %d\n", key);
+				}
 
 				// if (is_active[idx] == 0)
 				// 	printf("wrong_tile !!!\n");
@@ -125,6 +127,7 @@ __global__ void duplicateWithKeysFast(
 				// printf ("after: %d/%d - %d\n", x, y, key);
 			}
 		}
+		// count number of tiles each gaussian touched
 		// if (is_active[idx] == 1)
 		// 	tile_touched_active[idx] = (rect_max.y - rect_min.y) * (rect_max.x - rect_min.x);
 	}
@@ -287,6 +290,15 @@ int CudaRasterizer::Rasterizer::forward(
 	int* n_touched,
 	bool debug)
 {
+#ifdef TIMING
+	cudaEvent_t start, stop;
+	cudaEventCreate(&start);
+	cudaEventCreate(&stop);
+	float milliseconds = 0;
+	cudaEventRecord(start);
+	std::ofstream f("timing_ref.log", std::ofstream::app);
+#endif
+
 	const float focal_y = height / (2.0f * tan_fovy);
 	const float focal_x = width / (2.0f * tan_fovx);
 
@@ -340,9 +352,23 @@ int CudaRasterizer::Rasterizer::forward(
 		prefiltered
 	), debug)
 
+#ifdef TIMING
+	cudaEventRecord(stop);
+	cudaEventSynchronize(stop);
+	cudaEventElapsedTime(&milliseconds, start, stop);
+	f << "=== preprocessing: " << milliseconds << "\n";
+#endif
+
 	// Compute prefix sum over full list of touched tile counts by Gaussians
 	// E.g., [2, 3, 0, 2, 1] -> [2, 5, 5, 7, 8]
 	CHECK_CUDA(cub::DeviceScan::InclusiveSum(geomState.scanning_space, geomState.scan_size, geomState.tiles_touched, geomState.point_offsets, P), debug)
+
+#ifdef TIMING
+	cudaEventRecord(stop);
+	cudaEventSynchronize(stop);
+	cudaEventElapsedTime(&milliseconds, start, stop);
+	f << "=== inclusivesum: " << milliseconds << "\n";
+#endif
 
 	// Retrieve total number of Gaussian instances to launch and resize aux buffers
 	int num_rendered;
@@ -365,6 +391,13 @@ int CudaRasterizer::Rasterizer::forward(
 		tile_grid)
 	CHECK_CUDA(, debug)
 
+#ifdef TIMING
+	cudaEventRecord(stop);
+	cudaEventSynchronize(stop);
+	cudaEventElapsedTime(&milliseconds, start, stop);
+	f << "=== duplicate: " << milliseconds << "\n";
+#endif
+
 	int bit = getHigherMsb(tile_grid.x * tile_grid.y);
 
 	// Sort complete list of (duplicated) Gaussian indices by keys
@@ -375,6 +408,13 @@ int CudaRasterizer::Rasterizer::forward(
 		binningState.point_list_unsorted, binningState.point_list,
 		num_rendered, 0, 32 + bit), debug)
 
+#ifdef TIMING
+	cudaEventRecord(stop);
+	cudaEventSynchronize(stop);
+	cudaEventElapsedTime(&milliseconds, start, stop);
+	f << "=== radixsort: " << milliseconds << "\n";
+#endif
+
 	CHECK_CUDA(cudaMemset(imgState.ranges, 0, tile_grid.x * tile_grid.y * sizeof(uint2)), debug);
 
 	// Identify start and end of per-tile workloads in sorted list
@@ -384,6 +424,13 @@ int CudaRasterizer::Rasterizer::forward(
 			binningState.point_list_keys,
 			imgState.ranges);
 	CHECK_CUDA(, debug)
+
+#ifdef TIMING
+	cudaEventRecord(stop);
+	cudaEventSynchronize(stop);
+	cudaEventElapsedTime(&milliseconds, start, stop);
+	f << "=== tileranges: " << milliseconds << "\n";
+#endif
 
 	// Let each tile blend its range of Gaussians independently in parallel
 	const float* feature_ptr = colors_precomp != nullptr ? colors_precomp : geomState.rgb;
@@ -405,6 +452,13 @@ int CudaRasterizer::Rasterizer::forward(
 		n_touched
     ), debug)
 
+#ifdef TIMING
+	cudaEventRecord(stop);
+	cudaEventSynchronize(stop);
+	cudaEventElapsedTime(&milliseconds, start, stop);
+	f << "=== rasterization: " << milliseconds << "\n";
+	f << "==============================================\n";
+#endif
 	return num_rendered;
 }
 
@@ -439,6 +493,15 @@ int CudaRasterizer::Rasterizer::forward_fast(
 	const int* is_active,
 	int* tile_active)
 {
+#ifdef TIMING
+	cudaEvent_t start, stop;
+	cudaEventCreate(&start);
+	cudaEventCreate(&stop);
+	float milliseconds = 0;
+	cudaEventRecord(start);
+	std::ofstream f("timing_opt.log", std::ofstream::app);
+#endif
+
 	const float focal_y = height / (2.0f * tan_fovy);
 	const float focal_x = width / (2.0f * tan_fovx);
 
@@ -453,6 +516,7 @@ int CudaRasterizer::Rasterizer::forward_fast(
 
 	dim3 tile_grid((width + BLOCK_X - 1) / BLOCK_X, (height + BLOCK_Y - 1) / BLOCK_Y, 1);
 	dim3 block(BLOCK_X, BLOCK_Y, 1);
+	int num_tiles = tile_grid.x * tile_grid.y;
 
 	// Dynamically resize image-based auxiliary buffers during training
 	size_t img_chunk_size = required<ImageState>(width * height);
@@ -492,6 +556,13 @@ int CudaRasterizer::Rasterizer::forward_fast(
 		prefiltered
 	), debug)
 
+#ifdef TIMING
+	cudaEventRecord(stop);
+	cudaEventSynchronize(stop);
+	cudaEventElapsedTime(&milliseconds, start, stop);
+	f << "=== preprocessing: " << milliseconds << "\n";
+#endif
+
 	// Compute prefix sum over full list of touched tile counts by Gaussians
 	// E.g., [2, 3, 0, 2, 1] -> [2, 5, 5, 7, 8]
 	CHECK_CUDA(cub::DeviceScan::InclusiveSum(geomState.scanning_space, geomState.scan_size, geomState.tiles_touched, geomState.point_offsets, P), debug)
@@ -506,6 +577,13 @@ int CudaRasterizer::Rasterizer::forward_fast(
 
 	torch::Tensor tile_touched_active_mem = torch::full({P}, 0, torch::kInt32).to(torch::kCUDA);
 	int* tile_touched_active = tile_touched_active_mem.contiguous().data<int>();
+
+#ifdef TIMING
+	cudaEventRecord(stop);
+	cudaEventSynchronize(stop);
+	cudaEventElapsedTime(&milliseconds, start, stop);
+	f << "=== inclusivesum: " << milliseconds << "\n";
+#endif
 
 	// For each instance to be rendered, produce adequate [ tile | depth ] key
 	// and corresponding dublicated Gaussian indices to be sorted
@@ -523,6 +601,13 @@ int CudaRasterizer::Rasterizer::forward_fast(
 		tile_touched_active)
 	CHECK_CUDA(, debug)
 
+#ifdef TIMING
+	cudaEventRecord(stop);
+	cudaEventSynchronize(stop);
+	cudaEventElapsedTime(&milliseconds, start, stop);
+	f << "=== duplicate: " << milliseconds << "\n";
+#endif
+
 	/* dump touched tile */
 	// int tile_touched_active_cpu[P];
 	// cudaMemcpy(tile_touched_active_cpu, tile_touched_active, P * sizeof(int), cudaMemcpyDeviceToHost);
@@ -534,11 +619,29 @@ int CudaRasterizer::Rasterizer::forward_fast(
 	// cudaDeviceSynchronize();
 
 	/* dump active tile */
-	// int tile_active_cpu[3225];
-	// cudaMemcpy(tile_active_cpu, tile_active, 3225 * sizeof(int), cudaMemcpyDeviceToHost);
-	// cudaDeviceSynchronize();
-	// int total = 0;
-	// printf ("sum_host: %d\n", total);
+	int tile_active_cpu[num_tiles];
+	cudaMemcpy(tile_active_cpu, tile_active, num_tiles * sizeof(int), cudaMemcpyDeviceToHost);
+
+	int *tile_active_list_cpu = (int*)malloc(num_tiles * sizeof(int));
+	int active_count = 0;
+	for (int idx=0; idx<num_tiles; idx++)
+		if (tile_active_cpu[idx])
+		{
+			tile_active_list_cpu[active_count] = idx;
+			active_count++;
+		}
+	// TODO: temp bypass for zero active tiles, fix later
+	if (active_count == 0)
+	{
+		tile_active_list_cpu[active_count] = 0;
+		active_count++;
+	}
+
+	// for (int idx=0; idx<active_count; idx++)
+	// 	printf ("idx, %d, tile_idx, %d\n", idx, tile_active_list_cpu[idx]);
+
+	torch::Tensor tile_active_list_cuda = torch::from_blob(tile_active_list_cpu, {active_count}, torch::kInt32).to(torch::kCUDA);
+	int* tile_active_list = tile_active_list_cuda.contiguous().data<int>();
 
 	// printf ("Begin_of_dump_active_tile\n");
 	// for (int j=0; j<43; j++)
@@ -567,6 +670,13 @@ int CudaRasterizer::Rasterizer::forward_fast(
 		binningState.point_list_unsorted, binningState.point_list,
 		num_rendered, 0, 32 + bit), debug)
 
+#ifdef TIMING
+	cudaEventRecord(stop);
+	cudaEventSynchronize(stop);
+	cudaEventElapsedTime(&milliseconds, start, stop);
+	f << "=== radixsort: " << milliseconds << "\n";
+#endif
+
 	CHECK_CUDA(cudaMemset(imgState.ranges, 0, tile_grid.x * tile_grid.y * sizeof(uint2)), debug);
 
 	// Identify start and end of per-tile workloads in sorted list
@@ -577,6 +687,16 @@ int CudaRasterizer::Rasterizer::forward_fast(
 			imgState.ranges);
 	CHECK_CUDA(, debug)
 
+#ifdef TIMING
+	cudaEventRecord(stop);
+	cudaEventSynchronize(stop);
+	cudaEventElapsedTime(&milliseconds, start, stop);
+	f << "=== tileranges: " << milliseconds << "\n";
+#endif
+
+#ifdef TIMING
+	cudaEventRecord(start);
+#endif
 	// Let each tile blend its range of Gaussians independently in parallel
 	const float* feature_ptr = colors_precomp != nullptr ? colors_precomp : geomState.rgb;
 	CHECK_CUDA(FORWARD::render_fast(
@@ -595,9 +715,43 @@ int CudaRasterizer::Rasterizer::forward_fast(
 		out_depth,
 		out_opacity,
 		n_touched,
-		tile_active
+		tile_active,
+		active_count,
+		tile_active_list
+    ), debug)
+#ifdef TIMING
+	cudaEventRecord(stop);
+	cudaEventSynchronize(stop);
+	cudaEventElapsedTime(&milliseconds, start, stop);
+	f << "=== rasterization_opt: " << milliseconds << "\n";
+
+	cudaEventRecord(start);
+	// Let each tile blend its range of Gaussians independently in parallel
+	// const float* feature_ptr = colors_precomp != nullptr ? colors_precomp : geomState.rgb;
+	CHECK_CUDA(FORWARD::render(
+		tile_grid, block,
+		imgState.ranges,
+		binningState.point_list,
+		width, height,
+		geomState.means2D,
+		feature_ptr,
+		geomState.conic_opacity,
+		imgState.accum_alpha,
+		imgState.n_contrib,
+		background,
+		out_color,
+		geomState.depths,
+		out_depth,
+		out_opacity,
+		n_touched
     ), debug)
 
+	cudaEventRecord(stop);
+	cudaEventSynchronize(stop);
+	cudaEventElapsedTime(&milliseconds, start, stop);
+	f << "=== rasterization_ref: " << milliseconds << "\n";
+	f << "==============================================\n";
+#endif
 	return num_rendered;
 }
 

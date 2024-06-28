@@ -82,7 +82,9 @@ namespace FORWARD
 		float* out_depth,
 		float* out_opacity,
 		int* n_touched,
-		int* tile_active);
+		int* tile_active,
+		const int active_count,
+		int* tile_active_list);
 }
 
 
