@@ -53,7 +53,8 @@ namespace CudaRasterizer
 			float* out_opacity,
 			int* radii = nullptr,
 			int* n_touched = nullptr,
-			bool debug = false);
+			bool debug = false,
+			const std::string render_info = "");
 
 		static int forward_fast(
 			std::function<char* (size_t)> geometryBuffer,

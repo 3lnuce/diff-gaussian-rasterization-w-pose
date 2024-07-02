@@ -32,7 +32,8 @@ namespace cg = cooperative_groups;
 
 #include <torch/extension.h>
 
-#define TIMING
+// #define TIMING
+// #define LOG_TILE
 
 // Helper function to find the next-highest bit of the MSB
 // on the CPU.
@@ -288,7 +289,8 @@ int CudaRasterizer::Rasterizer::forward(
 	float* out_opacity,
 	int* radii,
 	int* n_touched,
-	bool debug)
+	bool debug,
+	const std::string render_info)
 {
 #ifdef TIMING
 	cudaEvent_t start, stop;
@@ -430,6 +432,28 @@ int CudaRasterizer::Rasterizer::forward(
 	cudaEventSynchronize(stop);
 	cudaEventElapsedTime(&milliseconds, start, stop);
 	f << "=== tileranges: " << milliseconds << "\n";
+#endif
+
+#ifdef LOG_TILE
+	// Dump render status
+	// imgState.ranges: gaussian idx ranges for each tile
+	int size = tile_grid.x * tile_grid.y;
+	uint2 mem_cpu[size];
+	cudaMemcpy(mem_cpu, imgState.ranges, size * sizeof(uint2), cudaMemcpyDeviceToHost);
+	uint32_t point_list_cpu[num_rendered];
+	cudaMemcpy(point_list_cpu, binningState.point_list, num_rendered * sizeof(uint32_t), cudaMemcpyDeviceToHost);
+
+	std::ofstream log_tiles(render_info, std::ofstream::out);
+	log_tiles << "# tile idx, gaussian idx1, idx2, ...\n";
+	log_tiles << "# total duplicated gaussians: " << num_rendered << "\n";
+	for (int tile_idx=0; tile_idx<size; tile_idx++)
+	{
+		log_tiles << tile_idx << ", ";
+		for (int idx_gaussian=mem_cpu[tile_idx].x; idx_gaussian<mem_cpu[tile_idx].y; idx_gaussian++)
+			log_tiles << point_list_cpu[idx_gaussian] << ", ";
+		log_tiles << "\n";
+	}
+	log_tiles.close();
 #endif
 
 	// Let each tile blend its range of Gaussians independently in parallel
