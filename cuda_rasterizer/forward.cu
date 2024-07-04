@@ -17,7 +17,7 @@
 #include <cooperative_groups/reduce.h>
 namespace cg = cooperative_groups;
 
-// #define USE_LIST
+#define USE_LIST
 
 // Forward method for converting the input spherical harmonics
 // coefficients of each Gaussian to a simple RGB color.

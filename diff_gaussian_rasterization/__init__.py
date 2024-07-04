@@ -58,6 +58,7 @@ def rasterize_gaussians_fast(
     rho,
     raster_settings,
     is_active,
+    tile_herr,
 ):
     return _RasterizeGaussiansFast.apply(
         means3D,
@@ -72,6 +73,7 @@ def rasterize_gaussians_fast(
         rho,
         raster_settings,
         is_active,
+        tile_herr,
     )
 
 
@@ -217,6 +219,7 @@ class _RasterizeGaussiansFast(torch.autograd.Function):
         rho,
         raster_settings,
         is_active,
+        tile_herr,
     ):
 
         # Restructure arguments the way that the C++ lib expects them
@@ -242,6 +245,7 @@ class _RasterizeGaussiansFast(torch.autograd.Function):
             raster_settings.prefiltered,
             raster_settings.debug,
             is_active,
+            tile_herr,
         )
 
         # Invoke C++/CUDA rasterizer
@@ -300,13 +304,13 @@ class _RasterizeGaussiansFast(torch.autograd.Function):
             cpu_args = cpu_deep_copy_tuple(args) # Copy them before they can be corrupted
             # TODO: Currently use original backward pass, will change it to cutstomized one later
             try:
-                grad_means2D, grad_colors_precomp, grad_opacities, grad_means3D, grad_cov3Ds_precomp, grad_sh, grad_scales, grad_rotations, grad_tau = _C.rasterize_gaussians_backward(*args)
+                grad_means2D, grad_colors_precomp, grad_opacities, grad_means3D, grad_cov3Ds_precomp, grad_sh, grad_scales, grad_rotations, grad_tau = _C.rasterize_gaussians_backward_fast(*args)
             except Exception as ex:
                 torch.save(cpu_args, "snapshot_bw.dump")
                 print("\nAn error occured in backward. Writing snapshot_bw.dump for debugging.\n")
                 raise ex
         else:
-             grad_means2D, grad_colors_precomp, grad_opacities, grad_means3D, grad_cov3Ds_precomp, grad_sh, grad_scales, grad_rotations, grad_tau = _C.rasterize_gaussians_backward(*args)
+             grad_means2D, grad_colors_precomp, grad_opacities, grad_means3D, grad_cov3Ds_precomp, grad_sh, grad_scales, grad_rotations, grad_tau = _C.rasterize_gaussians_backward_fast(*args)
         
         grad_tau = torch.sum(grad_tau.view(-1, 6), dim=0)
         grad_rho = grad_tau[:3].view(1, -1)
@@ -324,6 +328,7 @@ class _RasterizeGaussiansFast(torch.autograd.Function):
             grad_cov3Ds_precomp,
             grad_theta,
             grad_rho,
+            None,
             None,
             None,
         )
@@ -420,7 +425,7 @@ class GaussianRasterizerFast(nn.Module):
 
         return visible
 
-    def forward(self, means3D, means2D, opacities, shs = None, colors_precomp = None, scales = None, rotations = None, cov3D_precomp = None, theta=None, rho=None, is_active=None):
+    def forward(self, means3D, means2D, opacities, shs = None, colors_precomp = None, scales = None, rotations = None, cov3D_precomp = None, theta=None, rho=None, is_active=None, tile_herr=None):
 
         raster_settings = self.raster_settings
 
@@ -447,6 +452,8 @@ class GaussianRasterizerFast(nn.Module):
             rho = torch.Tensor([])
         if is_active is None:
             is_active = torch.Tensor([])
+        if tile_herr is None:
+            tile_herr = torch.Tensor([])
 
 
         # Invoke C++/CUDA rasterization routine
@@ -463,4 +470,5 @@ class GaussianRasterizerFast(nn.Module):
             rho,
             raster_settings,
             is_active,
+            tile_herr,
         )

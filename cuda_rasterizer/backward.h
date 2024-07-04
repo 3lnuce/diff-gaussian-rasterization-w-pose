@@ -40,6 +40,26 @@ namespace BACKWARD
 		float* dL_dcolors,
 		float* dL_ddepths);
 
+	void render_fast(
+		const dim3 grid, const dim3 block,
+		const uint2* ranges,
+		const uint32_t* point_list,
+		int W, int H,
+		const float* bg_color,
+		const float2* means2D,
+		const float4* conic_opacity,
+		const float* colors,
+		const float* depths,
+		const float* final_Ts,
+		const uint32_t* n_contrib,
+		const float* dL_dpixels,
+		const float* dL_dpixels_depth,
+		float3* dL_dmean2D,
+		float4* dL_dconic2D,
+		float* dL_dopacity,
+		float* dL_dcolors,
+		float* dL_ddepths);
+
 	void preprocess(
 		int P, int D, int M,
 		const float3* means,
