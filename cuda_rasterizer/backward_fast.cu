@@ -564,7 +564,7 @@ namespace cg = cooperative_groups;
 // Backward version of the rendering procedure.
 template <uint32_t C>
 __global__ void __launch_bounds__(BLOCK_X * BLOCK_Y)
-renderCUDA(
+renderCUDA_Fast(
 	const uint2* __restrict__ ranges,
 	const uint32_t* __restrict__ point_list,
 	int W, int H,
@@ -583,6 +583,7 @@ renderCUDA(
 	float* __restrict__ dL_dcolors,
 	float* __restrict__ dL_ddepths)
 {
+	printf ("using fast cuda backend\n");
 	// We rasterize again. Compute necessary block info.
 	auto block = cg::this_thread_block();
 	auto tid = block.thread_rank();
@@ -788,7 +789,6 @@ renderCUDA(
 	}
 }
 
-
 // void BACKWARD::preprocess(
 // 	int P, int D, int M,
 // 	const float3* means3D,
@@ -862,7 +862,7 @@ renderCUDA(
 // 		dL_dtau);
 // }
 
-void BACKWARD::render(
+void BACKWARD::render_fast(
 	const dim3 grid, const dim3 block,
 	const uint2* ranges,
 	const uint32_t* point_list,
@@ -882,7 +882,7 @@ void BACKWARD::render(
 	float* dL_dcolors,
 	float* dL_ddepths)
 {
-	renderCUDA<NUM_CHANNELS> << <grid, block >> >(
+	renderCUDA_Fast<NUM_CHANNELS> << <grid, block >> >(
 		ranges,
 		point_list,
 		W, H,
