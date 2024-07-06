@@ -930,7 +930,9 @@ void CudaRasterizer::Rasterizer::backward_fast(
 	float* dL_dscale,
 	float* dL_drot,
 	float* dL_dtau,
-	bool debug)
+	bool debug,
+	const int* is_active,
+	const int* tile_active)
 {
 	GeometryState geomState = GeometryState::fromChunk(geom_buffer, P);
 	BinningState binningState = BinningState::fromChunk(binning_buffer, R);
@@ -972,14 +974,16 @@ void CudaRasterizer::Rasterizer::backward_fast(
 		(float4*)dL_dconic,
 		dL_dopacity,
 		dL_dcolor,
-		dL_ddepth
+		dL_ddepth,
+		is_active,
+		tile_active
     ), debug)
 
 	// Take care of the rest of preprocessing. Was the precomputed covariance
 	// given to us or a scales/rot pair? If precomputed, pass that. If not,
 	// use the one we computed ourselves.
 	const float* cov3D_ptr = (cov3D_precomp != nullptr) ? cov3D_precomp : geomState.cov3D;
-	CHECK_CUDA(BACKWARD::preprocess(P, D, M,
+	CHECK_CUDA(BACKWARD::preprocess_fast(P, D, M,
 		(float3*)means3D,
 		radii,
 		shs,
@@ -1003,5 +1007,6 @@ void CudaRasterizer::Rasterizer::backward_fast(
 		dL_dsh,
 		(glm::vec3*)dL_dscale,
 		(glm::vec4*)dL_drot,
-		dL_dtau), debug)
+		dL_dtau,
+		is_active), debug)
 }

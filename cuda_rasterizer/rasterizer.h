@@ -154,7 +154,9 @@ namespace CudaRasterizer
 			float* dL_dscale,
 			float* dL_drot,
 			float* dL_dtau,
-			bool debug);
+			bool debug,
+			const int* is_active=nullptr,
+			const int* tile_active=nullptr);
 	};
 };
 

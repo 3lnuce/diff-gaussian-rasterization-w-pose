@@ -252,18 +252,18 @@ class _RasterizeGaussiansFast(torch.autograd.Function):
         if raster_settings.debug:
             cpu_args = cpu_deep_copy_tuple(args) # Copy them before they can be corrupted
             try:
-                num_rendered, color, radii, geomBuffer, binningBuffer, imgBuffer, depth, opacity, n_touched = _C.rasterize_gaussians_fast(*args)
+                num_rendered, color, radii, geomBuffer, binningBuffer, imgBuffer, depth, opacity, n_touched, tile_active = _C.rasterize_gaussians_fast(*args)
             except Exception as ex:
                 torch.save(cpu_args, "snapshot_fw.dump")
                 print("\nAn error occured in forward. Please forward snapshot_fw.dump for debugging.")
                 raise ex
         else:
-            num_rendered, color, radii, geomBuffer, binningBuffer, imgBuffer, depth, opacity, n_touched = _C.rasterize_gaussians_fast(*args)
+            num_rendered, color, radii, geomBuffer, binningBuffer, imgBuffer, depth, opacity, n_touched, tile_active = _C.rasterize_gaussians_fast(*args)
 
         # Keep relevant tensors for backward
         ctx.raster_settings = raster_settings
         ctx.num_rendered = num_rendered
-        ctx.save_for_backward(colors_precomp, means3D, scales, rotations, cov3Ds_precomp, radii, sh, geomBuffer, binningBuffer, imgBuffer)
+        ctx.save_for_backward(colors_precomp, means3D, scales, rotations, cov3Ds_precomp, radii, sh, geomBuffer, binningBuffer, imgBuffer, is_active, tile_active)
         return color, radii, depth, opacity, n_touched
 
     @staticmethod
@@ -272,7 +272,7 @@ class _RasterizeGaussiansFast(torch.autograd.Function):
         # Restore necessary values from context
         num_rendered = ctx.num_rendered
         raster_settings = ctx.raster_settings
-        colors_precomp, means3D, scales, rotations, cov3Ds_precomp, radii, sh, geomBuffer, binningBuffer, imgBuffer = ctx.saved_tensors
+        colors_precomp, means3D, scales, rotations, cov3Ds_precomp, radii, sh, geomBuffer, binningBuffer, imgBuffer, is_active, tile_active = ctx.saved_tensors
 
         # Restructure args as C++ method expects them
         args = (raster_settings.bg,
@@ -297,7 +297,9 @@ class _RasterizeGaussiansFast(torch.autograd.Function):
                 num_rendered,
                 binningBuffer,
                 imgBuffer,
-                raster_settings.debug)
+                raster_settings.debug,
+                is_active,
+                tile_active)
 
         # Compute gradients for relevant tensors by invoking backward method
         if raster_settings.debug:
