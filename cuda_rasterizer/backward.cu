@@ -1281,10 +1281,6 @@ renderCUDA_Fast(
 			// pair).
 			float dL_dalpha = 0.0f;
 			const int global_id = collected_id[j];
-#ifdef SKIP_TILE
-			if (is_active[global_id] != 1)
-				continue;
-#endif
 			float local_dL_dcolors[3];
 			#pragma unroll
 			for (int ch = 0; ch < C; ch++)
@@ -1343,6 +1339,13 @@ renderCUDA_Fast(
 				dL_dcolors_shared,
 				dL_ddepths_shared
 			);
+
+			// Non-active GS still contribute grads to active GS
+			// Only grad. accum. for non-active GS can be skipped
+#ifdef SKIP_TILE
+			if (is_active[global_id] != 1)
+				continue;
+#endif
 
 			if (tid == 0) {
 				float2 dL_dmean2D_acc = dL_dmean2D_shared[0];
