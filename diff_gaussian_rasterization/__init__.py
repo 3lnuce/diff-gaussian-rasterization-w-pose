@@ -246,6 +246,7 @@ class _RasterizeGaussiansFast(torch.autograd.Function):
             raster_settings.debug,
             is_active,
             tile_herr,
+            raster_settings.render_info,
         )
 
         # Invoke C++/CUDA rasterizer

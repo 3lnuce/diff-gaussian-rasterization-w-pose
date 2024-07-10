@@ -84,7 +84,8 @@ namespace CudaRasterizer
 			bool debug = false,
 			const int* is_active = nullptr,
 			int* tile_active = nullptr,
-			int* tile_herr = nullptr);
+			int* tile_herr = nullptr,
+			const std::string render_info = "");
 
 		static void backward(
 			const int P, int D, int M, int R,

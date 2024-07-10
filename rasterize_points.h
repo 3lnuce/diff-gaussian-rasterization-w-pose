@@ -62,7 +62,8 @@ RasterizeGaussiansCUDAFast(
 	const bool prefiltered,
 	const bool debug,
 	const torch::Tensor& is_active,
-	const torch::Tensor& tile_herr);
+	const torch::Tensor& tile_herr,
+	const std::string render_info);
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
  RasterizeGaussiansBackwardCUDA(

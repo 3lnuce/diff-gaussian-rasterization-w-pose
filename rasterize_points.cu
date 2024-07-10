@@ -146,7 +146,8 @@ RasterizeGaussiansCUDAFast(
 	const bool prefiltered,
 	const bool debug,
 	const torch::Tensor& is_active,
-	const torch::Tensor& tile_herr)
+	const torch::Tensor& tile_herr,
+	const std::string render_info)
 {
   if (means3D.ndimension() != 2 || means3D.size(1) != 3) {
     AT_ERROR("means3D must have dimensions (num_points, 3)");
@@ -216,7 +217,8 @@ RasterizeGaussiansCUDAFast(
 		debug,
 		is_active.contiguous().data<int>(),
 		tile_active.contiguous().data<int>(),
-		tile_herr.contiguous().data<int>()
+		tile_herr.contiguous().data<int>(),
+		render_info
 	  );
   }
   return std::make_tuple(rendered, out_color, radii, geomBuffer, binningBuffer, imgBuffer, out_depth, out_opaticy, n_touched, tile_active);

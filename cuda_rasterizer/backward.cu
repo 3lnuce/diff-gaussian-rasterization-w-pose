@@ -1164,7 +1164,7 @@ renderCUDA_Fast(
 
 #ifdef SKIP_TILE
 	uint32_t tile_idx = block.group_index().y * gridDim.x + block.group_index().x;
-	if (tile_active[tile_idx] == 0)
+	if (tile_active[tile_idx] != 1)
 		return;
 #endif
 
