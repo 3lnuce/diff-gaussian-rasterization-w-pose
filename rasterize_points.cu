@@ -123,7 +123,8 @@ RasterizeGaussiansCUDA(
   return std::make_tuple(rendered, out_color, radii, geomBuffer, binningBuffer, imgBuffer, out_depth, out_opaticy, n_touched);
 }
 
-std::tuple<int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+std::tuple<int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, \
+				torch::Tensor, torch::Tensor, torch::Tensor>
 RasterizeGaussiansCUDAFast(
 	const torch::Tensor& background,
 	const torch::Tensor& means3D,
@@ -145,9 +146,12 @@ RasterizeGaussiansCUDAFast(
 	const torch::Tensor& campos,
 	const bool prefiltered,
 	const bool debug,
-	const torch::Tensor& is_active,
-	const torch::Tensor& tile_herr,
-	const std::string render_info)
+	torch::Tensor& is_active,
+	torch::Tensor& tile_herr,
+	const std::string render_info,
+	bool gs2tile,
+	bool tile2gs,
+	torch::Tensor& freeze_mask)
 {
   if (means3D.ndimension() != 2 || means3D.size(1) != 3) {
     AT_ERROR("means3D must have dimensions (num_points, 3)");
@@ -178,6 +182,9 @@ RasterizeGaussiansCUDAFast(
   uint32_t hori_blocks = (W + BLOCK_X - 1) / BLOCK_X;
   uint32_t vert_blocks = (H + BLOCK_Y - 1) / BLOCK_Y;
   torch::Tensor tile_active = torch::full({hori_blocks * vert_blocks}, 0, means3D.options().dtype(torch::kInt32));
+
+  torch::Tensor freeze_mask_my = torch::full({P}, 1, means3D.options().dtype(torch::kBool));
+
 
   int rendered = 0;
   if(P != 0)
@@ -216,12 +223,17 @@ RasterizeGaussiansCUDAFast(
 		n_touched.contiguous().data<int>(),
 		debug,
 		is_active.contiguous().data<int>(),
-		tile_active.contiguous().data<int>(),
 		tile_herr.contiguous().data<int>(),
-		render_info
+		tile_herr.contiguous().data<int>(),
+		render_info,
+		gs2tile,
+		tile2gs,
+		// freeze_mask.contiguous().data<bool>()
+		freeze_mask_my.contiguous().data<bool>()
+
 	  );
   }
-  return std::make_tuple(rendered, out_color, radii, geomBuffer, binningBuffer, imgBuffer, out_depth, out_opaticy, n_touched, tile_active);
+  return std::make_tuple(rendered, out_color, radii, geomBuffer, binningBuffer, imgBuffer, out_depth, out_opaticy, n_touched, is_active, tile_herr, freeze_mask_my);
 }
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
