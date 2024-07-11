@@ -34,7 +34,7 @@ namespace cg = cooperative_groups;
 
 #define TIMING
 // #define LOG_TILE
-#define COMPARE
+// #define COMPARE
 
 // Helper function to find the next-highest bit of the MSB
 // on the CPU.
@@ -82,11 +82,15 @@ __global__ void duplicateWithKeysFast(
 	uint32_t* gaussian_values_unsorted,
 	int* radii,
 	dim3 grid,
-	const int* is_active,
+	int* gs_active,
 	int* tile_active,
 	int* tile_touched_active,
-	bool skip_inactive)
+	bool skip_inactive,
+	bool gs2tile,
+	bool tile2gs,
+	bool* freeze_mask)
 {
+	// printf("duplicatekeys flags gs2tile %d, tile2gs %d\n", gs2tile, tile2gs);
 	auto idx = cg::this_grid().thread_rank();
 	if (idx >= P)
 		return;
@@ -99,6 +103,8 @@ __global__ void duplicateWithKeysFast(
 		uint2 rect_min, rect_max;
 
 		getRect(points_xy[idx], radii[idx], rect_min, rect_max, grid);
+
+		bool should_freeze = false;
 
 		// For each tile that the bounding rect overlaps, emit a
 		// key/value pair. The key is |  tile ID  |      depth      |,
@@ -126,15 +132,38 @@ __global__ void duplicateWithKeysFast(
 				// key |= *((uint32_t*)&depths[idx]);
 
 
-				if (skip_inactive && (tile_active[key] != 1))
+				if (gs2tile && (gs_active[idx] == 1))
 				{
-					key = UINT64_MAX;
+					tile_active[key] = 1;
+					tile_active[key+1] = 1;
+					tile_active[key-1] = 1;
+					tile_active[key+grid.x] = 1;
+					tile_active[key-grid.x] = 1;
 				}
-				else
+
+				// printf ("debug tile2gs, tile_active[key]: %d, %d\n", tile2gs, tile_active[key]);
+
+				if (tile_active[key] != 1) // this gaussian intersects with non-active tiles, can't update it
+					should_freeze = true;
+
+				if (tile2gs && (tile_active[key] == 1))
 				{
-					key <<= 32;
-					key |= *((uint32_t*)&depths[idx]);
+					gs_active[idx] = 1;
 				}
+
+				if (!gs2tile && !tile2gs && (tile_active[key] != 1))
+				{
+					int y_temp = int((rect_max.y - rect_min.y) / 2);
+					int x_temp = int((rect_max.x - rect_min.x) / 2);
+					int key_temp = y_temp * grid.x + x_temp;
+					if (tile_active[key_temp] != 1)
+						// gs_active[idx] == 0;
+						freeze_mask[idx] = 0;
+				}
+
+				key <<= 32;
+				key |= *((uint32_t*)&depths[idx]);
+
 
 				gaussian_keys_unsorted[off] = key;
 				gaussian_values_unsorted[off] = idx;
@@ -143,6 +172,8 @@ __global__ void duplicateWithKeysFast(
 				// printf ("after: %d/%d - %d\n", x, y, key);
 			}
 		}
+		// if (tile2gs)
+		// 	freeze_mask[idx] = should_freeze;
 		// count number of tiles each gaussian touched
 		// if (is_active[idx] == 1)
 		// 	tile_touched_active[idx] = (rect_max.y - rect_min.y) * (rect_max.x - rect_min.x);
@@ -529,10 +560,13 @@ int CudaRasterizer::Rasterizer::forward_fast(
 	int* radii,
 	int* n_touched,
 	bool debug,
-	const int* is_active,
+	int* gs_active,
 	int* tile_active,
 	int* tile_herr,
-	const std::string render_info)
+	const std::string render_info,
+	bool gs2tile,
+	bool tile2gs,
+	bool* freeze_mask)
 {
 #ifdef TIMING
 	cudaEvent_t start, stop;
@@ -542,6 +576,8 @@ int CudaRasterizer::Rasterizer::forward_fast(
 	cudaEventRecord(start);
 	std::ofstream f("timing_opt.log", std::ofstream::app);
 #endif
+
+	std::cout << "perceived flags gs2tile, tile2gs: " << gs2tile << ", " << tile2gs << "\n";
 
 	const float focal_y = height / (2.0f * tan_fovy);
 	const float focal_x = width / (2.0f * tan_fovx);
@@ -595,7 +631,7 @@ int CudaRasterizer::Rasterizer::forward_fast(
 		tile_grid,
 		geomState.tiles_touched,
 		prefiltered,
-		is_active,
+		gs_active,
 		tile_active
 	), debug)
 
@@ -705,6 +741,7 @@ int CudaRasterizer::Rasterizer::forward_fast(
 	//////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 	// //  Faster version
 
+#ifndef COMPARE
 	// For each instance to be rendered, produce adequate [ tile | depth ] key
 	// and corresponding dublicated Gaussian indices to be sorted
 	duplicateWithKeysFast << <(P + 255) / 256, 256 >> > (
@@ -716,10 +753,13 @@ int CudaRasterizer::Rasterizer::forward_fast(
 		binningState.point_list_unsorted,
 		radii,
 		tile_grid,
-		is_active,
+		gs_active,
 		tile_active,
 		tile_touched_active,
-		true)
+		true,
+		gs2tile,
+		tile2gs,
+		freeze_mask)
 	CHECK_CUDA(, debug)
 
 #ifdef TIMING
@@ -733,41 +773,41 @@ int CudaRasterizer::Rasterizer::forward_fast(
 
 	// printf ("[DEBUG] Original number of GS for sorting: %d\n", num_rendered);
 
-	uint64_t point_list_keys_unsorted_cpu[num_rendered];
-	uint32_t point_list_unsorted_cpu[num_rendered];
-	cudaMemcpy(point_list_keys_unsorted_cpu, binningState.point_list_keys_unsorted, num_rendered * sizeof(uint64_t), cudaMemcpyDeviceToHost);
-	cudaMemcpy(point_list_unsorted_cpu, binningState.point_list_unsorted, num_rendered * sizeof(uint32_t), cudaMemcpyDeviceToHost);
+	// uint64_t point_list_keys_unsorted_cpu[num_rendered];
+	// uint32_t point_list_unsorted_cpu[num_rendered];
+	// cudaMemcpy(point_list_keys_unsorted_cpu, binningState.point_list_keys_unsorted, num_rendered * sizeof(uint64_t), cudaMemcpyDeviceToHost);
+	// cudaMemcpy(point_list_unsorted_cpu, binningState.point_list_unsorted, num_rendered * sizeof(uint32_t), cudaMemcpyDeviceToHost);
 
-	uint64_t *unsort_keys = (uint64_t*)malloc(num_rendered * sizeof(uint64_t));
-	uint32_t *unsort_vals = (uint32_t*)malloc(num_rendered * sizeof(uint32_t));
+	// uint64_t *unsort_keys = (uint64_t*)malloc(num_rendered * sizeof(uint64_t));
+	// uint32_t *unsort_vals = (uint32_t*)malloc(num_rendered * sizeof(uint32_t));
 
-	int counter = 0;
-	for (int idx=0; idx<num_rendered; idx++)
-	{
-		uint64_t key = point_list_keys_unsorted_cpu[idx];
-		if (key == UINT64_MAX)
-			continue;
-		uint32_t tile_key =  key >> 32;
-		if (tile_key >= 0 && tile_key < num_tiles)
-		{
-			unsort_keys[counter] = point_list_keys_unsorted_cpu[idx];
-			unsort_vals[counter] = point_list_unsorted_cpu[idx];
-			counter += 1;
-		}
-	}
-	printf ("[DEBUG] Pruned number of GS for sorting: %d\n", counter);
+	// int counter = 0;
+	// for (int idx=0; idx<num_rendered; idx++)
+	// {
+	// 	uint64_t key = point_list_keys_unsorted_cpu[idx];
+	// 	if (key == UINT64_MAX)
+	// 		continue;
+	// 	uint32_t tile_key =  key >> 32;
+	// 	if (tile_key >= 0 && tile_key < num_tiles)
+	// 	{
+	// 		unsort_keys[counter] = point_list_keys_unsorted_cpu[idx];
+	// 		unsort_vals[counter] = point_list_unsorted_cpu[idx];
+	// 		counter += 1;
+	// 	}
+	// }
+	// printf ("[DEBUG] Pruned number of GS for sorting: %d\n", counter);
 
-	uint64_t *unsort_keys_cuda;
-	uint32_t *unsort_vals_cuda;
-	// int* counter_cuda;
+	// uint64_t *unsort_keys_cuda;
+	// uint32_t *unsort_vals_cuda;
+	// // int* counter_cuda;
 
-	cudaMalloc((void **)&unsort_keys_cuda, counter * sizeof(uint64_t));
-	cudaMalloc((void **)&unsort_vals_cuda, counter * sizeof(uint32_t));
-	// cudaMalloc((void **)&counter_cuda, sizeof(int));
+	// cudaMalloc((void **)&unsort_keys_cuda, counter * sizeof(uint64_t));
+	// cudaMalloc((void **)&unsort_vals_cuda, counter * sizeof(uint32_t));
+	// // cudaMalloc((void **)&counter_cuda, sizeof(int));
 
-	cudaMemcpy(unsort_keys_cuda, unsort_keys, counter * sizeof(uint64_t), cudaMemcpyHostToDevice);
-	cudaMemcpy(unsort_vals_cuda, unsort_vals, counter * sizeof(uint32_t), cudaMemcpyHostToDevice);
-	// cudaMemcpy(counter_cuda, &counter, sizeof(int), cudaMemcpyHostToDevice);
+	// cudaMemcpy(unsort_keys_cuda, unsort_keys, counter * sizeof(uint64_t), cudaMemcpyHostToDevice);
+	// cudaMemcpy(unsort_vals_cuda, unsort_vals, counter * sizeof(uint32_t), cudaMemcpyHostToDevice);
+	// // cudaMemcpy(counter_cuda, &counter, sizeof(int), cudaMemcpyHostToDevice);
 
 
 #ifdef TIMING
@@ -783,27 +823,30 @@ int CudaRasterizer::Rasterizer::forward_fast(
 	CHECK_CUDA(cub::DeviceRadixSort::SortPairs(
 		binningState.list_sorting_space,
 		binningState.sorting_size,
-		// binningState.point_list_keys_unsorted, binningState.point_list_keys,
-		// binningState.point_list_unsorted, binningState.point_list,
-		// num_rendered, 0, 32 + bit), debug)
-		unsort_keys_cuda, binningState.point_list_keys,
-		unsort_vals_cuda, binningState.point_list,
-		counter, 0, 32 + bit), debug)
+		binningState.point_list_keys_unsorted, binningState.point_list_keys,
+		binningState.point_list_unsorted, binningState.point_list,
+		num_rendered, 0, 32 + bit), debug)
+		// unsort_keys_cuda, binningState.point_list_keys,
+		// unsort_vals_cuda, binningState.point_list,
+		// counter, 0, 32 + bit), debug)
 
 #ifdef TIMING
 	cudaEventRecord(stop);
 	cudaEventSynchronize(stop);
 	cudaEventElapsedTime(&milliseconds, start, stop);
 	f << "=== fast_partial_sort: " << milliseconds << "\n";
-	f << "=== fast_sort_num: " << counter << "\n";
+	// f << "=== fast_sort_num: " << counter << "\n";
 	cudaEventRecord(start);
 #endif
 	CHECK_CUDA(cudaMemset(imgState.ranges, 0, tile_grid.x * tile_grid.y * sizeof(uint2)), debug);
 
 	// Partial tile ranges
-	if (counter > 0)
-		identifyTileRanges << <(counter + 255) / 256, 256 >> > (
-			counter,
+	// if (counter > 0)
+	// 	identifyTileRanges << <(counter + 255) / 256, 256 >> > (
+	// 		counter,
+	if (num_rendered > 0)
+		identifyTileRanges << <(num_rendered + 255) / 256, 256 >> > (
+			num_rendered,
 			binningState.point_list_keys,
 			imgState.ranges);
 	CHECK_CUDA(, debug)
@@ -824,26 +867,52 @@ int CudaRasterizer::Rasterizer::forward_fast(
 
 	// Let each tile blend its range of Gaussians independently in parallel
 	const float* feature_ptr = colors_precomp != nullptr ? colors_precomp : geomState.rgb;
-	CHECK_CUDA(FORWARD::render_fast(
-		tile_grid, block,
-		imgState.ranges,
-		binningState.point_list,
-		width, height,
-		geomState.means2D,
-		feature_ptr,
-		geomState.conic_opacity,
-		imgState.accum_alpha,
-		imgState.n_contrib,
-		background,
-		out_color,
-		geomState.depths,
-		out_depth,
-		out_opacity,
-		n_touched,
-		tile_active,
-		active_count,
-		tile_active_list
-    ), debug)
+
+	if (gs2tile && !tile2gs)
+	{
+		printf ("Using basic render !!!\n");
+		CHECK_CUDA(FORWARD::render(
+			tile_grid, block,
+			imgState.ranges,
+			binningState.point_list,
+			width, height,
+			geomState.means2D,
+			feature_ptr,
+			geomState.conic_opacity,
+			imgState.accum_alpha,
+			imgState.n_contrib,
+			background,
+			out_color,
+			geomState.depths,
+			out_depth,
+			out_opacity,
+			n_touched
+		), debug)
+	}
+	else
+	{
+		printf ("Using fast render !!!\n");
+		CHECK_CUDA(FORWARD::render_fast(
+			tile_grid, block,
+			imgState.ranges,
+			binningState.point_list,
+			width, height,
+			geomState.means2D,
+			feature_ptr,
+			geomState.conic_opacity,
+			imgState.accum_alpha,
+			imgState.n_contrib,
+			background,
+			out_color,
+			geomState.depths,
+			out_depth,
+			out_opacity,
+			n_touched,
+			tile_active,
+			active_count,
+			tile_active_list
+		), debug)
+	}
 
 #ifdef TIMING
 	cudaEventRecord(stop);
@@ -853,6 +922,7 @@ int CudaRasterizer::Rasterizer::forward_fast(
 	f << "=== ref_num_tiles: " << active_count << "\n";
 	cudaEventRecord(start);
 #endif
+#endif // COMPARE
 
 	//////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 	//////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -873,10 +943,12 @@ int CudaRasterizer::Rasterizer::forward_fast(
 		binningState.point_list_unsorted,
 		radii,
 		tile_grid,
-		is_active,
+		gs_active,
 		tile_active,
 		tile_touched_active,
-		false)
+		false,
+		gs2tile,
+		tile2gs)
 	CHECK_CUDA(, debug)
 
 #ifdef TIMING
@@ -923,7 +995,7 @@ int CudaRasterizer::Rasterizer::forward_fast(
 #endif
 
 	// Let each tile blend its range of Gaussians independently in parallel
-	// const float* feature_ptr = colors_precomp != nullptr ? colors_precomp : geomState.rgb;
+	const float* feature_ptr = colors_precomp != nullptr ? colors_precomp : geomState.rgb;
 	CHECK_CUDA(FORWARD::render(
 		tile_grid, block,
 		imgState.ranges,
@@ -1100,7 +1172,7 @@ void CudaRasterizer::Rasterizer::backward_fast(
 	float* dL_drot,
 	float* dL_dtau,
 	bool debug,
-	const int* is_active,
+	const int* gs_active,
 	const int* tile_active)
 {
 	GeometryState geomState = GeometryState::fromChunk(geom_buffer, P);
@@ -1144,7 +1216,7 @@ void CudaRasterizer::Rasterizer::backward_fast(
 		dL_dopacity,
 		dL_dcolor,
 		dL_ddepth,
-		is_active,
+		gs_active,
 		tile_active
     ), debug)
 
@@ -1177,5 +1249,5 @@ void CudaRasterizer::Rasterizer::backward_fast(
 		(glm::vec3*)dL_dscale,
 		(glm::vec4*)dL_drot,
 		dL_dtau,
-		is_active), debug)
+		gs_active), debug)
 }

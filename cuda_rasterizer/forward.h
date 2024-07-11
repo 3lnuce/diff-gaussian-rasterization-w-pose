@@ -73,7 +73,7 @@ namespace FORWARD
 		const dim3 grid,
 		uint32_t* tiles_touched,
 		bool prefiltered,
-		const int* is_active,
+		int* gs_active,
 		int* tile_active);
 
 	// Main rasterization method.

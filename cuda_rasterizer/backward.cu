@@ -16,7 +16,7 @@
 #include <cooperative_groups/reduce.h>
 namespace cg = cooperative_groups;
 
-#define SKIP_TILE
+// #define SKIP_TILE
 
 // Backward pass for conversion of spherical harmonics to RGB for
 // each Gaussian.

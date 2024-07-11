@@ -82,10 +82,13 @@ namespace CudaRasterizer
 			int* radii = nullptr,
 			int* n_touched = nullptr,
 			bool debug = false,
-			const int* is_active = nullptr,
+			int* is_active = nullptr,
 			int* tile_active = nullptr,
 			int* tile_herr = nullptr,
-			const std::string render_info = "");
+			const std::string render_info = "",
+			bool gs2tile=false,
+			bool tile2gs=false,
+			bool* freeze_mask=nullptr);
 
 		static void backward(
 			const int P, int D, int M, int R,

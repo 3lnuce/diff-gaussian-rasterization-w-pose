@@ -182,7 +182,7 @@ __global__ void preprocessCUDA_Fast(int P, int D, int M,
 	const dim3 grid,
 	uint32_t* tiles_touched,
 	bool prefiltered,
-	const int* is_active,
+	int* gs_active,
 	int* tile_active)
 {
 	auto idx = cg::this_grid().thread_rank();
@@ -241,17 +241,6 @@ __global__ void preprocessCUDA_Fast(int P, int D, int M,
 	getRect(point_image, my_radius, rect_min, rect_max, grid);
 	if ((rect_max.x - rect_min.x) * (rect_max.y - rect_min.y) == 0)
 		return;
-
-	for (int y = rect_min.y; y < rect_max.y; y++)
-	{
-		for (int x = rect_min.x; x < rect_max.x; x++)
-		{
-			uint64_t key = y * grid.x + x;
-			if (is_active[idx] == 1)
-				tile_active[key] = 1;
-		}
-	}
-
 
 	// If colors have been precomputed, use them, otherwise convert
 	// spherical harmonics coefficients to RGB color.
@@ -780,7 +769,7 @@ void FORWARD::preprocess_fast(int P, int D, int M,
 	const dim3 grid,
 	uint32_t* tiles_touched,
 	bool prefiltered,
-	const int* is_active,
+	int* gs_active,
 	int* tile_active)
 {
 	preprocessCUDA_Fast<NUM_CHANNELS> << <(P + 255) / 256, 256 >> > (
@@ -809,7 +798,7 @@ void FORWARD::preprocess_fast(int P, int D, int M,
 		grid,
 		tiles_touched,
 		prefiltered,
-		is_active,
+		gs_active,
 		tile_active
 		);
 }
