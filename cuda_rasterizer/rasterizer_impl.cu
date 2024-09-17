@@ -725,14 +725,265 @@ int CudaRasterizer::Rasterizer::forward_fast(
 	cudaEventElapsedTime(&milliseconds, start, stop);
 	f << "=== rasterization_opt: " << milliseconds << "\n";
 
+	// cudaEventRecord(start);
+	// // Let each tile blend its range of Gaussians independently in parallel
+	// // const float* feature_ptr = colors_precomp != nullptr ? colors_precomp : geomState.rgb;
+	// CHECK_CUDA(FORWARD::render(
+	// 	tile_grid, block,
+	// 	imgState.ranges,
+	// 	binningState.point_list,
+	// 	width, height,
+	// 	geomState.means2D,
+	// 	feature_ptr,
+	// 	geomState.conic_opacity,
+	// 	imgState.accum_alpha,
+	// 	imgState.n_contrib,
+	// 	background,
+	// 	out_color,
+	// 	geomState.depths,
+	// 	out_depth,
+	// 	out_opacity,
+	// 	n_touched
+    // ), d// ebug)
+
+	// cudaEventRecord(stop);
+	// cudaEventSynchronize(stop);
+	// cudaEventElapsedTime(&milliseconds, start, stop);
+	// f << "=== rasterization_ref: " << milliseconds << "\n";
+	// f << "==============================================\n";
+#endif
+	return num_rendered;
+}
+
+
+// Forward rendering procedure for differentiable rasterization
+// of Gaussians.
+int CudaRasterizer::Rasterizer::fused_kernel(
+	std::function<char* (size_t)> geometryBuffer,
+	std::function<char* (size_t)> binningBuffer,
+	std::function<char* (size_t)> imageBuffer,
+	const int P, int D, int M,
+	const float* background,
+	const int width, int height,
+	const float* means3D,
+	const float* shs,
+	const float* colors_precomp,
+	const float* opacities,
+	const float* scales,
+	const float scale_modifier,
+	const float* rotations,
+	const float* cov3D_precomp,
+	const float* viewmatrix,
+	const float* projmatrix,
+    const float* projmatrix_raw,
+	const float* cam_pos,
+	const float tan_fovx, float tan_fovy,
+	const bool prefiltered,
+	const float* ref_color,
+	const double* ref_depth,
+	float* out_color,
+	float* out_depth,
+	float* out_opacity,
+	float* dL_dmean2D,
+	float* dL_dconic,
+	float* dL_dopacity,
+	float* dL_dcolor,
+	float* dL_ddepth,
+	float* dL_dmean3D,
+	float* dL_dcov3D,
+	float* dL_dsh,
+	float* dL_dscale,
+	float* dL_drot,
+	float* dL_dtau,
+	int* radii,
+	int* n_touched,
+	bool debug,
+	const int* is_active,
+	int* tile_active)
+{
+#ifdef TIMING
+	cudaEvent_t start, stop;
+	cudaEventCreate(&start);
+	cudaEventCreate(&stop);
+	float milliseconds = 0;
 	cudaEventRecord(start);
+	std::ofstream f("timing_opt.log", std::ofstream::app);
+#endif
+
+	const float focal_y = height / (2.0f * tan_fovy);
+	const float focal_x = width / (2.0f * tan_fovx);
+
+	size_t chunk_size = required<GeometryState>(P);
+	char* chunkptr = geometryBuffer(chunk_size);
+	GeometryState geomState = GeometryState::fromChunk(chunkptr, P);
+
+	if (radii == nullptr)
+	{
+		radii = geomState.internal_radii;
+	}
+
+	dim3 tile_grid((width + BLOCK_X - 1) / BLOCK_X, (height + BLOCK_Y - 1) / BLOCK_Y, 1);
+	dim3 block(BLOCK_X, BLOCK_Y, 1);
+	int num_tiles = tile_grid.x * tile_grid.y;
+
+	// Dynamically resize image-based auxiliary buffers during training
+	size_t img_chunk_size = required<ImageState>(width * height);
+	char* img_chunkptr = imageBuffer(img_chunk_size);
+	ImageState imgState = ImageState::fromChunk(img_chunkptr, width * height);
+
+	if (NUM_CHANNELS != 3 && colors_precomp == nullptr)
+	{
+		throw std::runtime_error("For non-RGB, provide precomputed Gaussian colors!");
+	}
+
+	// Run preprocessing per-Gaussian (transformation, bounding, conversion of SHs to RGB)
+	CHECK_CUDA(FORWARD::preprocess(
+		P, D, M,
+		means3D,
+		(glm::vec3*)scales,
+		scale_modifier,
+		(glm::vec4*)rotations,
+		opacities,
+		shs,
+		geomState.clamped,
+		cov3D_precomp,
+		colors_precomp,
+		viewmatrix, projmatrix,
+		(glm::vec3*)cam_pos,
+		width, height,
+		focal_x, focal_y,
+		tan_fovx, tan_fovy,
+		radii,
+		geomState.means2D,
+		geomState.depths,
+		geomState.cov3D,
+		geomState.rgb,
+		geomState.conic_opacity,
+		tile_grid,
+		geomState.tiles_touched,
+		prefiltered
+	), debug)
+
+#ifdef TIMING
+	cudaEventRecord(stop);
+	cudaEventSynchronize(stop);
+	cudaEventElapsedTime(&milliseconds, start, stop);
+	f << "=== preprocessing: " << milliseconds << "\n";
+#endif
+
+	// Compute prefix sum over full list of touched tile counts by Gaussians
+	// E.g., [2, 3, 0, 2, 1] -> [2, 5, 5, 7, 8]
+	CHECK_CUDA(cub::DeviceScan::InclusiveSum(geomState.scanning_space, geomState.scan_size, geomState.tiles_touched, geomState.point_offsets, P), debug)
+
+	// Retrieve total number of Gaussian instances to launch and resize aux buffers
+	int num_rendered;
+	CHECK_CUDA(cudaMemcpy(&num_rendered, geomState.point_offsets + P - 1, sizeof(int), cudaMemcpyDeviceToHost), debug);
+
+	size_t binning_chunk_size = required<BinningState>(num_rendered);
+	char* binning_chunkptr = binningBuffer(binning_chunk_size);
+	BinningState binningState = BinningState::fromChunk(binning_chunkptr, num_rendered);
+
+	torch::Tensor tile_touched_active_mem = torch::full({P}, 0, torch::kInt32).to(torch::kCUDA);
+	int* tile_touched_active = tile_touched_active_mem.contiguous().data<int>();
+
+#ifdef TIMING
+	cudaEventRecord(stop);
+	cudaEventSynchronize(stop);
+	cudaEventElapsedTime(&milliseconds, start, stop);
+	f << "=== inclusivesum: " << milliseconds << "\n";
+#endif
+
+	// For each instance to be rendered, produce adequate [ tile | depth ] key
+	// and corresponding dublicated Gaussian indices to be sorted
+	duplicateWithKeysFast << <(P + 255) / 256, 256 >> > (
+		P,
+		geomState.means2D,
+		geomState.depths,
+		geomState.point_offsets,
+		binningState.point_list_keys_unsorted,
+		binningState.point_list_unsorted,
+		radii,
+		tile_grid,
+		is_active,
+		tile_active,
+		tile_touched_active)
+	CHECK_CUDA(, debug)
+
+#ifdef TIMING
+	cudaEventRecord(stop);
+	cudaEventSynchronize(stop);
+	cudaEventElapsedTime(&milliseconds, start, stop);
+	f << "=== duplicate: " << milliseconds << "\n";
+#endif
+
+	/* dump active tile */
+	int tile_active_cpu[num_tiles];
+	cudaMemcpy(tile_active_cpu, tile_active, num_tiles * sizeof(int), cudaMemcpyDeviceToHost);
+
+	int *tile_active_list_cpu = (int*)malloc(num_tiles * sizeof(int));
+	int active_count = 0;
+	for (int idx=0; idx<num_tiles; idx++)
+		if (tile_active_cpu[idx])
+		{
+			tile_active_list_cpu[active_count] = idx;
+			active_count++;
+		}
+	// TODO: temp bypass for zero active tiles, fix later
+	if (active_count == 0)
+	{
+		tile_active_list_cpu[active_count] = 0;
+		active_count++;
+	}
+
+	torch::Tensor tile_active_list_cuda = torch::from_blob(tile_active_list_cpu, {active_count}, torch::kInt32).to(torch::kCUDA);
+	int* tile_active_list = tile_active_list_cuda.contiguous().data<int>();
+
+	int bit = getHigherMsb(tile_grid.x * tile_grid.y);
+
+	// Sort complete list of (duplicated) Gaussian indices by keys
+	CHECK_CUDA(cub::DeviceRadixSort::SortPairs(
+		binningState.list_sorting_space,
+		binningState.sorting_size,
+		binningState.point_list_keys_unsorted, binningState.point_list_keys,
+		binningState.point_list_unsorted, binningState.point_list,
+		num_rendered, 0, 32 + bit), debug)
+
+#ifdef TIMING
+	cudaEventRecord(stop);
+	cudaEventSynchronize(stop);
+	cudaEventElapsedTime(&milliseconds, start, stop);
+	f << "=== radixsort: " << milliseconds << "\n";
+#endif
+
+	CHECK_CUDA(cudaMemset(imgState.ranges, 0, tile_grid.x * tile_grid.y * sizeof(uint2)), debug);
+
+	// Identify start and end of per-tile workloads in sorted list
+	if (num_rendered > 0)
+		identifyTileRanges << <(num_rendered + 255) / 256, 256 >> > (
+			num_rendered,
+			binningState.point_list_keys,
+			imgState.ranges);
+	CHECK_CUDA(, debug)
+
+#ifdef TIMING
+	cudaEventRecord(stop);
+	cudaEventSynchronize(stop);
+	cudaEventElapsedTime(&milliseconds, start, stop);
+	f << "=== tileranges: " << milliseconds << "\n";
+#endif
+
+#ifdef TIMING
+	cudaEventRecord(start);
+#endif
 	// Let each tile blend its range of Gaussians independently in parallel
-	// const float* feature_ptr = colors_precomp != nullptr ? colors_precomp : geomState.rgb;
-	CHECK_CUDA(FORWARD::render(
+	const float* feature_ptr = colors_precomp != nullptr ? colors_precomp : geomState.rgb;
+	CHECK_CUDA(FORWARD::render_fused(
 		tile_grid, block,
 		imgState.ranges,
 		binningState.point_list,
 		width, height,
+		ref_color,
+		ref_depth,
 		geomState.means2D,
 		feature_ptr,
 		geomState.conic_opacity,
@@ -743,17 +994,57 @@ int CudaRasterizer::Rasterizer::forward_fast(
 		geomState.depths,
 		out_depth,
 		out_opacity,
-		n_touched
+		n_touched,
+		tile_active,
+		active_count,
+		tile_active_list,
+		(float3*)dL_dmean2D,
+		(float4*)dL_dconic,
+		dL_dopacity,
+		dL_dcolor,
+		dL_ddepth
     ), debug)
-
+#ifdef TIMING
 	cudaEventRecord(stop);
 	cudaEventSynchronize(stop);
 	cudaEventElapsedTime(&milliseconds, start, stop);
-	f << "=== rasterization_ref: " << milliseconds << "\n";
-	f << "==============================================\n";
+	f << "=== rasterization_opt: " << milliseconds << "\n";
 #endif
+
+	// TODO: original backward preprocess
+	// Take care of the rest of preprocessing. Was the precomputed covariance
+	// given to us or a scales/rot pair? If precomputed, pass that. If not,
+	// use the one we computed ourselves.
+	const float* cov3D_ptr = (cov3D_precomp != nullptr) ? cov3D_precomp : geomState.cov3D;
+	CHECK_CUDA(BACKWARD::preprocess(P, D, M,
+		(float3*)means3D,
+		radii,
+		shs,
+		geomState.clamped,
+		(glm::vec3*)scales,
+		(glm::vec4*)rotations,
+		scale_modifier,
+		cov3D_ptr,
+		viewmatrix,
+		projmatrix,
+        projmatrix_raw,
+		focal_x, focal_y,
+		tan_fovx, tan_fovy,
+		(glm::vec3*)cam_pos,
+		(float3*)dL_dmean2D,
+		dL_dconic,
+		(glm::vec3*)dL_dmean3D,
+		dL_dcolor,
+		dL_ddepth,
+		dL_dcov3D,
+		dL_dsh,
+		(glm::vec3*)dL_dscale,
+		(glm::vec4*)dL_drot,
+		dL_dtau), debug)
+
 	return num_rendered;
 }
+
 
 // Produce necessary gradients for optimization, corresponding
 // to forward render pass

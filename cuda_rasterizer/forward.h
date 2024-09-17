@@ -85,6 +85,33 @@ namespace FORWARD
 		int* tile_active,
 		const int active_count,
 		int* tile_active_list);
+
+	void render_fused(
+		const dim3 grid, dim3 block,
+		const uint2* ranges,
+		const uint32_t* point_list,
+		int W, int H,
+		const float* ref_color,
+		const double* ref_depth,
+		const float2* points_xy_image,
+		const float* features,
+		const float4* conic_opacity,
+		float* final_T,
+		uint32_t* n_contrib,
+		const float* bg_color,
+		float* out_color,
+		const float* depth,
+		float* out_depth,
+		float* out_opacity,
+		int* n_touched,
+		int* tile_active,
+		const int active_count,
+		int* tile_active_list,
+		float3* dL_dmean2D,
+		float4* dL_dconic2D,
+		float* dL_dopacity,
+		float* dL_dcolors,
+		float* dL_ddepths);
 }
 
 
