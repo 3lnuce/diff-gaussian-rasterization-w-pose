@@ -1073,13 +1073,15 @@ renderCUDAFused(
 
 	const int dummy_size = BLOCK_SIZE;
 	// __shared__ bool processed[BLOCK_SIZE * dummy_size] = { false };
-	__shared__ bool processed[dummy_size];
+	// __shared__ int processed[dummy_size];
 	// bool processed[dummy_size] = { false };
+	// unsigned char processed[dummy_size] = { 0 };
+	__shared__ unsigned char processed[dummy_size];
 	// float buffer_alpha[dummy_size] = { 0.f };
 	// float buffer_G[dummy_size] = { 0.f };
 
-	if (toDo > dummy_size)
-		printf ("TODO exceeding %d !!! %d\n", dummy_size, toDo);
+	// if (toDo > dummy_size)
+	// 	printf ("TODO exceeding %d !!! %d\n", dummy_size, toDo);
 
 	// Initialize helper variables
 	float T = 1.0f;
@@ -1117,7 +1119,9 @@ renderCUDAFused(
 		{
 			// Keep track of current position in range
 			contributor++;
-			processed[contributor] = false;
+			// processed[contributor] = false;
+			processed[contributor-1] = 0;
+
 
 
 			// Resample using conic matrix (cf. "Surface
@@ -1162,7 +1166,8 @@ renderCUDAFused(
 			last_contributor = contributor;
 
 			// processed[tid * dummy_size + i * BLOCK_SIZE + j] = true;
-			processed[contributor] = true;
+			// processed[contributor] = true;
+			processed[contributor-1] = 1;
 			// buffer_alpha[contributor] = alpha;
 			// buffer_G[contributor] = G;
 		}
@@ -1180,6 +1185,24 @@ renderCUDAFused(
 		out_depth[pix_id] = D;
 		out_opacity[pix_id] = 1 - T;
 	}
+
+	// block.sync();
+	// if (tile_idx == 10)
+	// {
+	// 	for (int th_idx=0; th_idx<BLOCK_SIZE; th_idx++)
+	// 	{
+	// 		if (tid == th_idx)
+	// 		{
+	// 			printf("todo: %d, tile idx: %d, thread idx: %d: ", range.y - range.x, tile_idx, tid);
+	// 			for (int i=0; i<dummy_size; i++)
+	// 				printf ("%d, ", processed[i]);
+	// 			printf ("\n");
+	// 		}
+	// 		block.sync();
+	// 	}
+	// }
+	// block.sync();
+
 
 	// block.sync();
 
@@ -1230,7 +1253,7 @@ renderCUDAFused(
 	// screen-space viewport corrdinates (-1 to 1)
 	const float ddelx_dx = 0.5f * W;
 	const float ddely_dy = 0.5f * H;
-	__shared__ int skip_counter;
+	// __shared__ int skip_counter;
 
 	// Traverse all Gaussians
 	for (int i = 0; i < rounds; i++, toDo -= BLOCK_SIZE)
@@ -1254,10 +1277,10 @@ renderCUDAFused(
 		// }
 		for (int j = 0; j < min(BLOCK_SIZE, toDo); j++) {
 			block.sync();
-			if (tid == 0) {
-				skip_counter = 0;
-			}
-			block.sync();
+			// if (tid == 0) {
+			// 	skip_counter = 0;
+			// }
+			// block.sync();
 
 			// processed[tid * dummy_size + i * BLOCK_SIZE + j] = true;
 
@@ -1271,6 +1294,10 @@ renderCUDAFused(
 			// float alpha = buffer_alpha[contributor];
 			// float G = buffer_G[contributor];
 			contributor = done ? contributor : contributor - 1;
+
+			if (processed[contributor] == 0)
+				continue;
+
 			skip |= contributor >= last_contributor;
 
 			// // Compute blending values, as before.
@@ -1295,13 +1322,13 @@ renderCUDAFused(
 			// float alpha = skip ? 0.f : min(0.99f, con_o.w * G);
 
 
-			if (skip) {
-				atomicAdd(&skip_counter, 1);
-			}
-			block.sync();
-			if (skip_counter == BLOCK_SIZE) {
-				continue;
-			}
+			// if (skip) {
+			// 	atomicAdd(&skip_counter, 1);
+			// }
+			// block.sync();
+			// if (skip_counter == BLOCK_SIZE) {
+			// 	continue;
+			// }
 
 
 			T = skip ? T : T / (1.f - alpha);
@@ -1391,6 +1418,17 @@ renderCUDAFused(
 				atomicAdd(&dL_dcolors[global_id * CHANNELS + 1], dL_dcolors_acc.y);
 				atomicAdd(&dL_dcolors[global_id * CHANNELS + 2], dL_dcolors_acc.z);
 				atomicAdd(&dL_ddepths[global_id], dL_ddepths_acc);
+
+				// dL_dmean2D[global_id].x += dL_dmean2D_acc.x;
+				// dL_dmean2D[global_id].y += dL_dmean2D_acc.y;
+				// dL_dconic2D[global_id].x += dL_dconic2D_acc.x;
+				// dL_dconic2D[global_id].y += dL_dconic2D_acc.y;
+				// dL_dconic2D[global_id].w += dL_dconic2D_acc.w;
+				// dL_dopacity[global_id] += dL_dopacity_acc;
+				// dL_dcolors[global_id * CHANNELS + 0] += dL_dcolors_acc.x;
+				// dL_dcolors[global_id * CHANNELS + 1] += dL_dcolors_acc.y;
+				// dL_dcolors[global_id * CHANNELS + 2] += dL_dcolors_acc.z;
+				// dL_ddepths[global_id] += dL_ddepths_acc;
 			}
 		}
 	}
@@ -1501,6 +1539,17 @@ void FORWARD::render_fused(
 	float* dL_dcolors,
 	float* dL_ddepths)
 {
+
+	// size_t shared_mem_size = 32 * 1024;
+	// cudaError_t err = cudaFuncSetAttribute(renderCUDAFused<NUM_CHANNELS>, cudaFuncAttributeMaxDynamicSharedMemorySize, shared_mem_size);
+	// if (err != cudaSuccess)
+	// {
+	// 	printf ("Error setting shared memory size %s\n", cudaGetErrorString(err));
+	// 	// return -1;
+	// }
+
+	cudaFuncSetCacheConfig(renderCUDAFused<NUM_CHANNELS>, cudaFuncCachePreferShared);
+
 #ifdef USE_LIST
 	dim3 grid1d(active_count, 1, 1);
 	renderCUDAFused<NUM_CHANNELS> << <grid1d, block >> > (

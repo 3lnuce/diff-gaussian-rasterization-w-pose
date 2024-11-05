@@ -637,6 +637,7 @@ int CudaRasterizer::Rasterizer::forward_fast(
 		active_count++;
 	}
 
+	printf ("Active tiles: %d\n", active_count);
 	// for (int idx=0; idx<active_count; idx++)
 	// 	printf ("idx, %d, tile_idx, %d\n", idx, tile_active_list_cpu[idx]);
 
