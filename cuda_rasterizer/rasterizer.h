@@ -120,7 +120,9 @@ namespace CudaRasterizer
 			float* dL_dscale,
 			float* dL_drot,
 			float* dL_dtau,
-			bool debug);
+			bool debug,
+			bool is_init,
+			const std::string render_info = "");
 
 		static void backward_fast(
 			const int P, int D, int M, int R,

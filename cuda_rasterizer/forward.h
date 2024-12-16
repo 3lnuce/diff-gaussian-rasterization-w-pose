@@ -74,7 +74,8 @@ namespace FORWARD
 		uint32_t* tiles_touched,
 		bool prefiltered,
 		const int* is_active,
-		int* tile_active);
+		int* tile_active,
+		uint32_t* skip_counter);
 
 	// Main rasterization method.
 	void render(
@@ -92,7 +93,9 @@ namespace FORWARD
 		const float* depth,
 		float* out_depth,
 		float* out_opacity,
-		int* n_touched);
+		int* n_touched,
+		uint32_t* gaussian_touched,
+		uint32_t* pixel_touched);
 
 	// Fast rasterization method.
 	void render_fast(

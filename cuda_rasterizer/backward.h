@@ -38,7 +38,10 @@ namespace BACKWARD
 		float4* dL_dconic2D,
 		float* dL_dopacity,
 		float* dL_dcolors,
-		float* dL_ddepths);
+		float* dL_ddepths,
+		bool is_init,
+		uint32_t* total_ops,
+		uint32_t* skip_ops);
 
 	void render_fast(
 		const dim3 grid, const dim3 block,

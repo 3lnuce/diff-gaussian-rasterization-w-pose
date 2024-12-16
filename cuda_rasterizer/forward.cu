@@ -19,6 +19,10 @@ namespace cg = cooperative_groups;
 
 #define USE_LIST
 
+// #define PROFILE
+
+// #define INTERSECT
+
 // Forward method for converting the input spherical harmonics
 // coefficients of each Gaussian to a simple RGB color.
 __device__ glm::vec3 computeColorFromSH(int idx, int deg, int max_coeffs, const glm::vec3* means, glm::vec3 campos, const float* shs, bool* clamped)
@@ -183,7 +187,8 @@ __global__ void preprocessCUDA_Fast(int P, int D, int M,
 	uint32_t* tiles_touched,
 	bool prefiltered,
 	const int* is_active,
-	int* tile_active)
+	int* tile_active,
+	uint32_t* skip_counter)
 {
 	auto idx = cg::this_grid().thread_rank();
 	if (idx >= P)
@@ -242,15 +247,46 @@ __global__ void preprocessCUDA_Fast(int P, int D, int M,
 	if ((rect_max.x - rect_min.x) * (rect_max.y - rect_min.y) == 0)
 		return;
 
+	// int intersect_counter = 0;
+	// int local_counter = 0;
 	for (int y = rect_min.y; y < rect_max.y; y++)
 	{
 		for (int x = rect_min.x; x < rect_max.x; x++)
 		{
+			// intersect_counter++;
 			uint64_t key = y * grid.x + x;
-			if (is_active[idx] == 1)
+			if (is_active[idx] > 0)
 				tile_active[key] = 1;
+
+
+			// float2 xy = point_image;
+			// float2 pixf = {float(x * BLOCK_X), float(y * BLOCK_Y)};
+			// float2 d = { xy.x - pixf.x, xy.y - pixf.y };
+			// float4 con_o = { conic.x, conic.y, conic.z, opacities[idx] };
+			// float power = -0.5f * (con_o.x * d.x * d.x + con_o.z * d.y * d.y) - con_o.y * d.x * d.y;
+			// if (power > 0.0f)
+			// {
+			// 	// printf ("Return 1 !!!\n");
+			// 	local_counter++;
+			// 	continue;
+			// }
+
+
+			// float alpha = min(0.99f, con_o.w * exp(power));
+			// if (alpha < 1.0f / 255.0f) {
+			// 	// printf ("Return 2 !!!\n");
+			// 	local_counter++;
+			// 	continue;
+			// }
 		}
 	}
+
+	// if ((local_counter * 1.0f / intersect_counter) >= 0.8)
+	// {
+	// 	// printf ("skipping\n");
+	// 	atomicAdd(skip_counter, 1);
+	// 	return;
+	// }
 
 
 	// If colors have been precomputed, use them, otherwise convert
@@ -350,7 +386,11 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	float mid = 0.5f * (cov.x + cov.z);
 	float lambda1 = mid + sqrt(max(0.1f, mid * mid - det));
 	float lambda2 = mid - sqrt(max(0.1f, mid * mid - det));
+#ifdef INTERSECT
 	float my_radius = ceil(3.f * sqrt(max(lambda1, lambda2)));
+#else
+	float my_radius = ceil(3.f * sqrt(max(lambda1, lambda2)));
+#endif
 	float2 point_image = { ndc2Pix(p_proj.x, W), ndc2Pix(p_proj.y, H) };
 	uint2 rect_min, rect_max;
 	getRect(point_image, my_radius, rect_min, rect_max, grid);
@@ -395,7 +435,9 @@ renderCUDA(
 	const float* __restrict__ depth,
 	float* __restrict__ out_depth,
 	float* __restrict__ out_opacity,
-	int * __restrict__ n_touched)
+	int * __restrict__ n_touched,
+	uint32_t* __restrict__ gaussian_touched,
+	uint32_t* __restrict__ pixel_touched)
 {
 	// Identify current tile and associated min/max pixel range.
 	auto block = cg::this_thread_block();
@@ -422,6 +464,11 @@ renderCUDA(
 	__shared__ float2 collected_xy[BLOCK_SIZE];
 	__shared__ float4 collected_conic_opacity[BLOCK_SIZE];
 	__shared__ float collected_depth[BLOCK_SIZE];
+
+#ifdef PROFILE
+	int touched_gaussian[1000] = { 0 };
+	int thread_counter = 0;
+#endif
 
 	// Initialize helper variables
 	float T = 1.0f;
@@ -493,8 +540,25 @@ renderCUDA(
 			// Keep track of last range entry to update this
 			// pixel.
 			last_contributor = contributor;
+
+#ifdef PROFILE
+			touched_gaussian[j] = 1;
+			thread_counter++;
+#endif
 		}
 	}
+
+#ifdef PROFILE
+	atomicAdd(pixel_touched, thread_counter);
+	if (block.thread_rank() == 0)
+	{
+		int local_sum = 0;
+		// count gaussian processed
+		for (int i=0; i<1000; i++)
+			local_sum += touched_gaussian[i];
+		atomicAdd(gaussian_touched, local_sum);
+	}
+#endif
 
 	// All threads that treat valid pixel write out their final
 	// rendering data to the frame and auxiliary buffers.
@@ -593,6 +657,7 @@ renderCUDAFast(
 	// Initialize helper variables
 	float T = 1.0f;
 	uint32_t contributor = 0;
+	// uint32_t skip_counter = 0;
 	uint32_t last_contributor = 0;
 	float C[CHANNELS] = { 0 };
 	float D = 0.0f;
@@ -630,7 +695,11 @@ renderCUDAFast(
 			float4 con_o = collected_conic_opacity[j];
 			float power = -0.5f * (con_o.x * d.x * d.x + con_o.z * d.y * d.y) - con_o.y * d.x * d.y;
 			if (power > 0.0f)
+			{
+				// printf ("Return 1 !!!\n");
+				// skip_counter++;
 				continue;
+			}
 
 			// Eq. (2) from 3D Gaussian splatting paper.
 			// Obtain alpha by multiplying with Gaussian opacity
@@ -638,6 +707,8 @@ renderCUDAFast(
 			// Avoid numerical instabilities (see paper appendix).
 			float alpha = min(0.99f, con_o.w * exp(power));
 			if (alpha < 1.0f / 255.0f) {
+				// printf ("Return 2 !!!\n");
+				// skip_counter++;
 				continue;
 			}
 			float test_T = T * (1 - alpha);
@@ -662,6 +733,18 @@ renderCUDAFast(
 			last_contributor = contributor;
 		}
 	}
+
+	// if (block.group_index().x == 0 && block.group_index().y == 0)
+	// {
+	// 	printf ("valid gs range: %d-%d, rounds: %d", range.y, range.x, rounds);
+	// 	for (int i=0; i<(range.y - range.x); i++)
+	// 		printf ("thread id %d, gs id: %d\n", block.thread_rank(), touched[i]);
+	// }
+
+	// printf ("skip ratio: %d, %d, %d\n", skip_counter, contributor, last_contributor);
+	// printf ("proc ratio: %d, %d, %f\n", contributor, range.y - range.x, T);
+	// if (skip_counter >= contributor)
+	// 	printf ("skip ratio: %d, %d, %d\n", skip_counter, contributor, last_contributor);
 
 	// All threads that treat valid pixel write out their final
 	// rendering data to the frame and auxiliary buffers.
@@ -692,7 +775,9 @@ void FORWARD::render(
 	const float* depth,
 	float* out_depth,
 	float* out_opacity,
-	int* n_touched)
+	int* n_touched,
+	uint32_t* gaussian_touched,
+	uint32_t* pixel_touched)
 {
 	renderCUDA<NUM_CHANNELS> << <grid, block >> > (
 		ranges,
@@ -708,7 +793,9 @@ void FORWARD::render(
 		depth,
 		out_depth,
 		out_opacity,
-		n_touched);
+		n_touched,
+		gaussian_touched,
+		pixel_touched);
 }
 
 void FORWARD::render_fast(
@@ -781,7 +868,8 @@ void FORWARD::preprocess_fast(int P, int D, int M,
 	uint32_t* tiles_touched,
 	bool prefiltered,
 	const int* is_active,
-	int* tile_active)
+	int* tile_active,
+	uint32_t* skip_counter)
 {
 	preprocessCUDA_Fast<NUM_CHANNELS> << <(P + 255) / 256, 256 >> > (
 		P, D, M,
@@ -810,7 +898,8 @@ void FORWARD::preprocess_fast(int P, int D, int M,
 		tiles_touched,
 		prefiltered,
 		is_active,
-		tile_active
+		tile_active,
+		skip_counter
 		);
 }
 

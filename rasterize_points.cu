@@ -248,7 +248,9 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
 	const int R,
 	const torch::Tensor& binningBuffer,
 	const torch::Tensor& imageBuffer,
-	const bool debug)
+	const bool debug,
+	const bool is_init,
+	const std::string render_info)
 {
   const int P = means3D.size(0);
   const int H = dL_dout_color.size(1);
@@ -307,7 +309,9 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
 	  dL_dscales.contiguous().data<float>(),
 	  dL_drotations.contiguous().data<float>(),
       dL_dtau.contiguous().data<float>(),
-	  debug);
+	  debug,
+	  is_init,
+	  render_info);
   }
 
   return std::make_tuple(dL_dmeans2D, dL_dcolors, dL_dopacity, dL_dmeans3D, dL_dcov3D, dL_dsh, dL_dscales, dL_drotations, dL_dtau);

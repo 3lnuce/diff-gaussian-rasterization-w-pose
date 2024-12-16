@@ -94,6 +94,13 @@ class _RasterizeGaussians(torch.autograd.Function):
         raster_settings,
     ):
 
+        f = open("log_backend_ref", "a+")
+        f.write(raster_settings.render_info + "\n")
+
+        tic_loop = torch.cuda.Event(enable_timing=True)
+        toc_loop = torch.cuda.Event(enable_timing=True)
+        tic_loop.record()
+
         # Restructure arguments the way that the C++ lib expects them
         args = (
             raster_settings.bg,
@@ -131,19 +138,42 @@ class _RasterizeGaussians(torch.autograd.Function):
         else:
             num_rendered, color, radii, geomBuffer, binningBuffer, imgBuffer, depth, opacity, n_touched = _C.rasterize_gaussians(*args)
 
+        toc_loop.record()
+        torch.cuda.synchronize()
+        f.write("[Frontend_ref][rast]: %f\n" % tic_loop.elapsed_time(toc_loop))
+        f.flush()
+
+        tic_loop.record()
+
         # Keep relevant tensors for backward
         ctx.raster_settings = raster_settings
         ctx.num_rendered = num_rendered
         ctx.save_for_backward(colors_precomp, means3D, scales, rotations, cov3Ds_precomp, radii, sh, geomBuffer, binningBuffer, imgBuffer)
+
+        toc_loop.record()
+        torch.cuda.synchronize()
+        f.write("[Frontend_ref][save]: %f\n" % tic_loop.elapsed_time(toc_loop))
+        f.flush()
         return color, radii, depth, opacity, n_touched
 
     @staticmethod
     def backward(ctx, grad_out_color, grad_out_radii, grad_out_depth, grad_out_opacity, grad_n_touched):
 
+        f = open("log_backend_ref", "a+")
+        tic_loop = torch.cuda.Event(enable_timing=True)
+        toc_loop = torch.cuda.Event(enable_timing=True)
+        tic_loop.record()
+
         # Restore necessary values from context
         num_rendered = ctx.num_rendered
         raster_settings = ctx.raster_settings
         colors_precomp, means3D, scales, rotations, cov3Ds_precomp, radii, sh, geomBuffer, binningBuffer, imgBuffer = ctx.saved_tensors
+
+        # print ("[DEBUG]", raster_settings.render_info)
+        is_init = False
+        if ("initialization" in raster_settings.render_info):
+            is_init = True
+        print (is_init)
 
         # Restructure args as C++ method expects them
         args = (raster_settings.bg,
@@ -168,7 +198,15 @@ class _RasterizeGaussians(torch.autograd.Function):
                 num_rendered,
                 binningBuffer,
                 imgBuffer,
-                raster_settings.debug)
+                raster_settings.debug,
+                is_init,
+                raster_settings.render_info,)
+
+        toc_loop.record()
+        torch.cuda.synchronize()
+        f.write("[Backend_grads_ref][load]: %f\n" % tic_loop.elapsed_time(toc_loop))
+        f.flush()
+        tic_loop.record()
 
         # Compute gradients for relevant tensors by invoking backward method
         if raster_settings.debug:
@@ -182,10 +220,15 @@ class _RasterizeGaussians(torch.autograd.Function):
         else:
              grad_means2D, grad_colors_precomp, grad_opacities, grad_means3D, grad_cov3Ds_precomp, grad_sh, grad_scales, grad_rotations, grad_tau = _C.rasterize_gaussians_backward(*args)
 
+        toc_loop.record()
+        torch.cuda.synchronize()
+        f.write("[Backend_grads_ref][rast]: %f\n" % tic_loop.elapsed_time(toc_loop))
+        f.flush()
+        tic_loop.record()
+
         grad_tau = torch.sum(grad_tau.view(-1, 6), dim=0)
         grad_rho = grad_tau[:3].view(1, -1)
         grad_theta = grad_tau[3:].view(1, -1)
-
 
         grads = (
             grad_means3D,
@@ -201,6 +244,10 @@ class _RasterizeGaussians(torch.autograd.Function):
             None,
         )
 
+        toc_loop.record()
+        torch.cuda.synchronize()
+        f.write("[Backend_grads_ref][post]: %f\n" % tic_loop.elapsed_time(toc_loop))
+        f.flush()
         return grads
 
 class _RasterizeGaussiansFast(torch.autograd.Function):
@@ -221,6 +268,13 @@ class _RasterizeGaussiansFast(torch.autograd.Function):
         is_active,
         tile_herr,
     ):
+
+        f = open("log_backend_opt", "a+")
+        f.write(raster_settings.render_info + "\n")
+
+        tic_loop = torch.cuda.Event(enable_timing=True)
+        toc_loop = torch.cuda.Event(enable_timing=True)
+        tic_loop.record()
 
         # Restructure arguments the way that the C++ lib expects them
         args = (
@@ -248,6 +302,7 @@ class _RasterizeGaussiansFast(torch.autograd.Function):
             tile_herr,
             raster_settings.render_info,
         )
+        # print (raster_settings.render_info)
 
         # Invoke C++/CUDA rasterizer
         if raster_settings.debug:
@@ -261,14 +316,34 @@ class _RasterizeGaussiansFast(torch.autograd.Function):
         else:
             num_rendered, color, radii, geomBuffer, binningBuffer, imgBuffer, depth, opacity, n_touched, tile_active = _C.rasterize_gaussians_fast(*args)
 
+
+        toc_loop.record()
+        torch.cuda.synchronize()
+        f.write("[frontend_opt][rast]: %f\n" % tic_loop.elapsed_time(toc_loop))
+        f.flush()
+
+        tic_loop.record()
+
         # Keep relevant tensors for backward
         ctx.raster_settings = raster_settings
         ctx.num_rendered = num_rendered
         ctx.save_for_backward(colors_precomp, means3D, scales, rotations, cov3Ds_precomp, radii, sh, geomBuffer, binningBuffer, imgBuffer, is_active, tile_active)
+
+        toc_loop.record()
+        torch.cuda.synchronize()
+        f.write("[frontend_opt][save]: %f\n" % tic_loop.elapsed_time(toc_loop))
+        f.flush()
+
         return color, radii, depth, opacity, n_touched
 
     @staticmethod
     def backward(ctx, grad_out_color, grad_out_radii, grad_out_depth, grad_out_opacity, grad_n_touched):
+
+        f = open("log_backend_opt", "a+")
+        
+        tic_loop = torch.cuda.Event(enable_timing=True)
+        toc_loop = torch.cuda.Event(enable_timing=True)
+        tic_loop.record()
 
         # Restore necessary values from context
         num_rendered = ctx.num_rendered
@@ -302,6 +377,14 @@ class _RasterizeGaussiansFast(torch.autograd.Function):
                 is_active,
                 tile_active)
 
+        toc_loop.record()
+        torch.cuda.synchronize()
+        f.write("[Backend_grads_opt][load]: %f\n" % tic_loop.elapsed_time(toc_loop))
+        f.flush()
+
+        tic_loop.record()
+
+
         # Compute gradients for relevant tensors by invoking backward method
         if raster_settings.debug:
             cpu_args = cpu_deep_copy_tuple(args) # Copy them before they can be corrupted
@@ -314,7 +397,17 @@ class _RasterizeGaussiansFast(torch.autograd.Function):
                 raise ex
         else:
              grad_means2D, grad_colors_precomp, grad_opacities, grad_means3D, grad_cov3Ds_precomp, grad_sh, grad_scales, grad_rotations, grad_tau = _C.rasterize_gaussians_backward_fast(*args)
-        
+
+
+        toc_loop.record()
+        torch.cuda.synchronize()
+        # print("[Backend_grads_opt]: ", tic_loop.elapsed_time(toc_loop))
+        f.write("[Backend_grads_opt][rast]: %f\n" % tic_loop.elapsed_time(toc_loop))
+        # f.write("\n")
+        f.flush()
+
+
+
         grad_tau = torch.sum(grad_tau.view(-1, 6), dim=0)
         grad_rho = grad_tau[:3].view(1, -1)
         grad_theta = grad_tau[3:].view(1, -1)
