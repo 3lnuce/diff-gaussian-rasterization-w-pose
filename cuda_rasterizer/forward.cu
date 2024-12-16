@@ -201,7 +201,9 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	float4* conic_opacity,
 	const dim3 grid,
 	uint32_t* tiles_touched,
-	bool prefiltered)
+	bool prefiltered
+	// float* out_lambda
+	)
 {
 	auto idx = cg::this_grid().thread_rank();
 	if (idx >= P)
@@ -277,6 +279,13 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	// Inverse 2D covariance and opacity neatly pack into one float4
 	conic_opacity[idx] = { conic.x, conic.y, conic.z, opacities[idx] };
 	tiles_touched[idx] = (rect_max.y - rect_min.y) * (rect_max.x - rect_min.x);
+
+	// if (out_lambda != nullptr)
+	// {
+	// 	out_lambda[idx + 0] = lambda1;
+	// 	out_lambda[idx + 1] = lambda2;
+	// }
+	// // out_lambda[idx] = {lambda1, lambda2};
 }
 
 // Main rasterization method. Collaboratively works on one tile per
@@ -452,6 +461,10 @@ renderCUDAFast(
 	if (tile_active[tile_idx] == 0)
 		return;
 #endif
+
+	// uint32_t tile_idx = block.group_index().y * gridDim.x + block.group_index().x;
+	// if ((tile_idx != 2532) && (tile_idx != 2079))
+	// 	return;
 
 	uint2 pix_min = { block_coord_x * BLOCK_X, block_coord_y * BLOCK_Y };
 	uint2 pix_max = { min(pix_min.x + BLOCK_X, W), min(pix_min.y + BLOCK_Y , H) };
@@ -1605,7 +1618,9 @@ void FORWARD::preprocess(int P, int D, int M,
 	float4* conic_opacity,
 	const dim3 grid,
 	uint32_t* tiles_touched,
-	bool prefiltered)
+	bool prefiltered
+	// float* out_lambda
+	)
 {
 	preprocessCUDA<NUM_CHANNELS> << <(P + 255) / 256, 256 >> > (
 		P, D, M,
@@ -1633,5 +1648,6 @@ void FORWARD::preprocess(int P, int D, int M,
 		grid,
 		tiles_touched,
 		prefiltered
+		// out_lambda=out_lambda
 		);
 }

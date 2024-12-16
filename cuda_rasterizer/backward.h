@@ -18,6 +18,8 @@
 #define GLM_FORCE_CUDA
 #include <glm/glm.hpp>
 
+#include <string>
+
 namespace BACKWARD
 {
 	void render(
@@ -30,6 +32,7 @@ namespace BACKWARD
 		const float4* conic_opacity,
 		const float* colors,
 		const float* depths,
+		// const float* lambda,
 		const float* final_Ts,
 		const uint32_t* n_contrib,
 		const float* dL_dpixels,
@@ -38,7 +41,9 @@ namespace BACKWARD
 		float4* dL_dconic2D,
 		float* dL_dopacity,
 		float* dL_dcolors,
-		float* dL_ddepths);
+		float* dL_ddepths,
+		bool is_init,
+		const std::string render_info);
 
 	void preprocess(
 		int P, int D, int M,

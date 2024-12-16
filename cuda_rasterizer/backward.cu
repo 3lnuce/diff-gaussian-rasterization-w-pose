@@ -16,6 +16,10 @@
 #include <cooperative_groups/reduce.h>
 namespace cg = cooperative_groups;
 
+#include <string>
+
+// #define VANILLA
+
 // Backward pass for conversion of spherical harmonics to RGB for
 // each Gaussian.
 __device__ void computeColorFromSH(int idx, int deg, int max_coeffs, const glm::vec3* means, glm::vec3 campos, const float* shs, const bool* clamped, const glm::vec3* dL_dcolor, glm::vec3* dL_dmeans, glm::vec3* dL_dshs,  float *dL_dtau)
@@ -558,6 +562,8 @@ __device__ void render_cuda_reduce_sum(group_t g, Lists... lists) {
   }
 }
 
+// vanilla backward pass for gradient aggregation
+#ifdef VANILLA
 
 // Backward version of the rendering procedure.
 template <uint32_t C>
@@ -571,6 +577,7 @@ renderCUDA(
 	const float4* __restrict__ conic_opacity,
 	const float* __restrict__ colors,
 	const float* __restrict__ depths,
+	// const float* __restrict__ lambda,
 	const float* __restrict__ final_Ts,
 	const uint32_t* __restrict__ n_contrib,
 	const float* __restrict__ dL_dpixels,
@@ -579,7 +586,463 @@ renderCUDA(
 	float4* __restrict__ dL_dconic2D,
 	float* __restrict__ dL_dopacity,
 	float* __restrict__ dL_dcolors,
-	float* __restrict__ dL_ddepths)
+	float* __restrict__ dL_ddepths,
+	bool is_init,
+	int batch
+	// char* render_info
+	)
+{
+	// We rasterize again. Compute necessary block info.
+	auto block = cg::this_thread_block();
+	auto tid = block.thread_rank();
+
+	// printf ("grid x, y: %d, %d\n", block.group_index().x, block.group_index().y);
+
+	if (!is_init)
+	{
+		int x_grid = block.group_index().x;
+		int y_grid = block.group_index().y;
+		bool is_valid = false;
+		switch(batch) {
+			case 0: // Batch 1: even x, even y
+				is_valid = (x_grid % 2 == 0) && (y_grid % 2 == 0);
+				break;
+			case 1: // Batch 2: even x, odd y
+				is_valid = (x_grid % 2 == 0) && (y_grid % 2 != 0);
+				break;
+			case 2: // Batch 3: odd x, even y
+				is_valid = (x_grid % 2 != 0) && (y_grid % 2 == 0);
+				break;
+			case 3: // Batch 4: odd x, odd y
+				is_valid = (x_grid % 2 != 0) && (y_grid % 2 != 0);
+				break;
+			default:
+				break;
+		}
+
+		if (!is_valid)
+			return;
+	}
+
+	// if (!is_init)
+	// {
+	// 	int x_grid = block.group_index().x;
+	// 	int y_grid = block.group_index().y;
+	// 	bool is_valid = false;
+
+	// 	int tile_index = y_grid * 75 + x_grid;
+	// 	// int assigned_batch = (tile_index * 40) / (75 * 43);
+
+    //     int x_step = (x_grid * 10) / 75;  // Spread batches across x-axis
+    //     int y_step = (y_grid * 10) / 43; // Spread batches across y-axis
+
+    //     // Calculate final batch number using combined x and y spacing
+    //     int assigned_batch = (x_step + y_step) % 10;
+
+
+	// 	if (assigned_batch == batch)
+	// 		is_valid = true;
+
+	// 	if (!is_valid)
+	// 		return;
+	// }
+
+	const uint32_t horizontal_blocks = (W + BLOCK_X - 1) / BLOCK_X;
+	const uint2 pix_min = { block.group_index().x * BLOCK_X, block.group_index().y * BLOCK_Y };
+	const uint2 pix_max = { min(pix_min.x + BLOCK_X, W), min(pix_min.y + BLOCK_Y , H) };
+	const uint2 pix = { pix_min.x + block.thread_index().x, pix_min.y + block.thread_index().y };
+	const uint32_t pix_id = W * pix.y + pix.x;
+	const float2 pixf = { (float)pix.x, (float)pix.y };
+
+	const bool inside = pix.x < W&& pix.y < H;
+	const uint2 range = ranges[block.group_index().y * horizontal_blocks + block.group_index().x];
+
+	const int rounds = ((range.y - range.x + BLOCK_SIZE - 1) / BLOCK_SIZE);
+
+	bool done = !inside;
+	int toDo = range.y - range.x;
+
+	__shared__ int collected_id[BLOCK_SIZE];
+	__shared__ float2 collected_xy[BLOCK_SIZE];
+	__shared__ float4 collected_conic_opacity[BLOCK_SIZE];
+	__shared__ float collected_colors[C * BLOCK_SIZE];
+	__shared__ float collected_depths[BLOCK_SIZE];
+
+	__shared__ float2 dL_dmean2D_shared[BLOCK_SIZE];
+	__shared__ float3 dL_dcolors_shared[BLOCK_SIZE];
+	__shared__ float dL_ddepths_shared[BLOCK_SIZE];
+	__shared__ float dL_dopacity_shared[BLOCK_SIZE];
+	__shared__ float4 dL_dconic2D_shared[BLOCK_SIZE];
+
+	// In the forward, we stored the final value for T, the
+	// product of all (1 - alpha) factors.
+	const float T_final = inside ? final_Ts[pix_id] : 0;
+	float T = T_final;
+
+	// We start from the back. The ID of the last contributing
+	// Gaussian is known from each pixel from the forward.
+	uint32_t contributor = toDo;
+	const int last_contributor = inside ? n_contrib[pix_id] : 0;
+
+	float accum_rec[C] = { 0 };
+	float dL_dpixel[C] = { 0 };
+	float accum_rec_depth = 0;
+	float dL_dpixel_depth = 0;
+	if (inside) {
+		#pragma unroll
+		for (int i = 0; i < C; i++) {
+			dL_dpixel[i] = dL_dpixels[i * H * W + pix_id];
+		}
+		dL_dpixel_depth = dL_dpixels_depth[pix_id];
+	}
+
+	float last_alpha = 0.f;
+	float last_color[C] = { 0.f };
+	float last_depth = 0.f;
+
+	// Gradient of pixel coordinate w.r.t. normalized
+	// screen-space viewport corrdinates (-1 to 1)
+	const float ddelx_dx = 0.5f * W;
+	const float ddely_dy = 0.5f * H;
+	// __shared__ int skip_counter;
+
+	int processed = 0;
+	int skipped = 0;
+
+	// Traverse all Gaussians
+	for (int i = 0; i < rounds; i++, toDo -= BLOCK_SIZE)
+	{
+		// Load auxiliary data into shared memory, start in the BACK
+		// and load them in revers order.
+		block.sync();
+		const int progress = i * BLOCK_SIZE + tid;
+		if (range.x + progress < range.y)
+		{
+			const int coll_id = point_list[range.y - progress - 1];
+			collected_id[tid] = coll_id;
+			collected_xy[tid] = points_xy_image[coll_id];
+			collected_conic_opacity[tid] = conic_opacity[coll_id];
+			#pragma unroll
+			for (int i = 0; i < C; i++) {
+				collected_colors[i * BLOCK_SIZE + tid] = colors[coll_id * C + i];
+			}
+			collected_depths[tid] = depths[coll_id];
+		}
+		block.sync();
+		for (int j = 0; !done && j < min(BLOCK_SIZE, toDo); j++) {
+			processed++;
+			// block.sync();
+			// if (tid == 0) {
+			// 	skip_counter = 0;
+			// }
+			// block.sync();
+
+			// Keep track of current Gaussian ID. Skip, if this one
+			// is behind the last contributor for this pixel.
+			// bool skip = done;
+			contributor--;
+			if (contributor >= last_contributor)
+				continue;
+			// contributor = done ? contributor : contributor - 1;
+			// skip |= contributor >= last_contributor;
+
+			// Compute blending values, as before.
+			const float2 xy = collected_xy[j];
+			const float2 d = { xy.x - pixf.x, xy.y - pixf.y };
+			const float4 con_o = collected_conic_opacity[j];
+			const float power = -0.5f * (con_o.x * d.x * d.x + con_o.z * d.y * d.y) - con_o.y * d.x * d.y;
+			if (power > 0.0f)
+				continue;
+			// skip |= power > 0.0f;
+
+			const float G = exp(power);
+			const float alpha = min(0.99f, con_o.w * G);
+			if (alpha < 1.0f / 255.0f)
+				continue;
+			// skip |= alpha < 1.0f / 255.0f;
+
+			// if (skip) {
+			// 	atomicAdd(&skip_counter, 1);
+			// }
+			// block.sync();
+			// if (skip_counter == BLOCK_SIZE) {
+			// 	continue;
+			// }
+
+
+			T = T / (1.f - alpha);
+			const float dchannel_dcolor = alpha * T;
+
+			bool skip_aggre = false;
+
+			// // Skip ops on this thread
+			// // float diff = d.x * (d.x * con_o.x + d.y * con_o.y) + d.y * (d.x * con_o.y + d.y * con_o.z);
+			// float diff = -2 * power;
+			// // printf ("debug diff %f\n", diff);
+			// // diff = diff * 3.f;
+			// if (d.x * d.x + d.y * d.y >= 64)
+			// {
+			// 	if (!(std::abs(diff - 0.25) < 1e-2))
+			// 	// if (diff >= 2)
+			// 	{
+			// 		// printf ("skipping %f\n", diff);
+			// 		// continue;
+			// 		skip_aggre = true;
+			// 		skipped++;
+			// 	}
+			// }
+
+// // #ifdef USE_SAMPLE
+			if ((!is_init) && ((d.x > 2) || (d.y > 2)))
+			{
+
+				// if (!(std::abs(G - 0.5) < 1e-2))
+				// if (!((alpha > 0.3) && (alpha < 0.5)))
+				// if (alpha > 0.001)
+				// if (alpha > 0.005)
+				// if (alpha > 0.01)
+				// if (alpha > 0.05)
+				// if (alpha < 0.01)
+
+				//////////////////////////////////
+				// if (0)
+				// if (alpha < 0.05)
+				// if (alpha < 0.01)
+				// if (alpha < 0.1)
+				// if (alpha < 0.2)
+				if (alpha < 0.3)
+				// if (alpha < 0.4)
+				// if (alpha < 0.5)
+				// if (alpha < 0.6)
+				// if (!((alpha > 0.005) && (alpha < 0.01)))
+				// if (!((alpha > 0.005) && (alpha < 0.02)))
+				{
+					// skip_aggre = true;
+					skip_aggre = true;
+				}
+			}
+// #endif
+
+
+			// Propagate gradients to per-Gaussian colors and keep
+			// gradients w.r.t. alpha (blending factor for a Gaussian/pixel
+			// pair).
+			float dL_dalpha = 0.0f;
+			const int global_id = collected_id[j];
+			float local_dL_dcolors[3];
+			#pragma unroll
+			for (int ch = 0; ch < C; ch++)
+			{
+				const float c = collected_colors[ch * BLOCK_SIZE + j];
+				// Update last color (to be used in the next iteration)
+				accum_rec[ch] = last_alpha * last_color[ch] + (1.f - last_alpha) * accum_rec[ch];
+				last_color[ch] = c;
+
+				const float dL_dchannel = dL_dpixel[ch];
+				dL_dalpha += (c - accum_rec[ch]) * dL_dchannel;
+				// if (!skip_aggre)
+					// atomicAdd(&(dL_dcolors[global_id * C + ch]), dchannel_dcolor * dL_dchannel);
+					// dL_dcolors[global_id * C + ch] += dchannel_dcolor * dL_dchannel;
+
+				if (!skip_aggre)
+				{
+					if (is_init)
+						atomicAdd(&(dL_dcolors[global_id * C + ch]), dchannel_dcolor * dL_dchannel);
+					else
+						dL_dcolors[global_id * C + ch] += dchannel_dcolor * dL_dchannel;
+				}
+
+				// dL_dcolors[global_id * C + ch] += dchannel_dcolor * dL_dchannel;
+				// local_dL_dcolors[ch] = dchannel_dcolor * dL_dchannel;
+			}
+			// dL_dcolors_shared[tid].x = local_dL_dcolors[0];
+			// dL_dcolors_shared[tid].y = local_dL_dcolors[1];
+			// dL_dcolors_shared[tid].z = local_dL_dcolors[2];
+
+			const float depth = collected_depths[j];
+			accum_rec_depth = last_alpha * last_depth + (1.f - last_alpha) * accum_rec_depth;
+			last_depth = depth;
+			dL_dalpha += (depth - accum_rec_depth) * dL_dpixel_depth;
+			// dL_ddepths[global_id] += dchannel_dcolor * dL_dpixel_depth; // TODO
+			// if (!skip_aggre)
+				// atomicAdd(&dL_ddepths[global_id], dchannel_dcolor * dL_dpixel_depth);
+				// dL_ddepths[global_id] += dchannel_dcolor * dL_dpixel_depth;
+
+			if (!skip_aggre)
+			{
+				if (is_init)
+					atomicAdd(&dL_ddepths[global_id], dchannel_dcolor * dL_dpixel_depth);
+				else
+					dL_ddepths[global_id] += dchannel_dcolor * dL_dpixel_depth;
+			}
+
+			dL_dalpha *= T;
+			// Update last alpha (to be used in the next iteration)
+			last_alpha = alpha;
+
+			// Account for fact that alpha also influences how much of
+			// the background color is added if nothing left to blend
+			float bg_dot_dpixel = 0.f;
+			#pragma unroll
+			for (int i = 0; i < C; i++) {
+				bg_dot_dpixel +=  bg_color[i] * dL_dpixel[i];
+			}
+			dL_dalpha += (-T_final / (1.f - alpha)) * bg_dot_dpixel;
+
+			// Helpful reusable temporary variables
+			const float dL_dG = con_o.w * dL_dalpha;
+			const float gdx = G * d.x;
+			const float gdy = G * d.y;
+			const float dG_ddelx = -gdx * con_o.x - gdy * con_o.y;
+			const float dG_ddely = -gdy * con_o.z - gdx * con_o.y;
+
+			// if (!skip_aggre)
+			// {
+			// 	// atomicAdd(&dL_dmean2D[global_id].x, dL_dG * dG_ddelx * ddelx_dx);
+			// 	// atomicAdd(&dL_dmean2D[global_id].y, dL_dG * dG_ddely * ddely_dy);
+
+			// 	// atomicAdd(&dL_dconic2D[global_id].x, -0.5f * gdx * d.x * dL_dG);
+			// 	// atomicAdd(&dL_dconic2D[global_id].y, -0.5f * gdx * d.y * dL_dG);
+			// 	// atomicAdd(&dL_dconic2D[global_id].w, -0.5f * gdy * d.y * dL_dG);
+			// 	// atomicAdd(&dL_dopacity[global_id], G * dL_dalpha);
+
+			// 	dL_dmean2D[global_id].x += dL_dG * dG_ddelx * ddelx_dx;
+			// 	dL_dmean2D[global_id].y += dL_dG * dG_ddely * ddely_dy;
+
+			// 	dL_dconic2D[global_id].x += -0.5f * gdx * d.x * dL_dG;
+			// 	dL_dconic2D[global_id].y += -0.5f * gdx * d.y * dL_dG;
+			// 	dL_dconic2D[global_id].w += -0.5f * gdy * d.y * dL_dG;
+			// 	dL_dopacity[global_id] += G * dL_dalpha;
+			// }
+
+			if (!skip_aggre)
+			{
+				if (is_init)
+				{
+					atomicAdd(&dL_dmean2D[global_id].x, dL_dG * dG_ddelx * ddelx_dx);
+					atomicAdd(&dL_dmean2D[global_id].y, dL_dG * dG_ddely * ddely_dy);
+
+					atomicAdd(&dL_dconic2D[global_id].x, -0.5f * gdx * d.x * dL_dG);
+					atomicAdd(&dL_dconic2D[global_id].y, -0.5f * gdx * d.y * dL_dG);
+					atomicAdd(&dL_dconic2D[global_id].w, -0.5f * gdy * d.y * dL_dG);
+					atomicAdd(&dL_dopacity[global_id], G * dL_dalpha);
+				}
+				else
+				{
+					atomicAdd(&dL_dmean2D[global_id].x, dL_dG * dG_ddelx * ddelx_dx);
+					atomicAdd(&dL_dmean2D[global_id].y, dL_dG * dG_ddely * ddely_dy);
+
+					atomicAdd(&dL_dconic2D[global_id].x, -0.5f * gdx * d.x * dL_dG);
+					atomicAdd(&dL_dconic2D[global_id].y, -0.5f * gdx * d.y * dL_dG);
+					atomicAdd(&dL_dconic2D[global_id].w, -0.5f * gdy * d.y * dL_dG);
+
+					// dL_dmean2D[global_id].x += dL_dG * dG_ddelx * ddelx_dx;
+					// dL_dmean2D[global_id].y += dL_dG * dG_ddely * ddely_dy;
+
+					// dL_dconic2D[global_id].x += -0.5f * gdx * d.x * dL_dG;
+					// dL_dconic2D[global_id].y += -0.5f * gdx * d.y * dL_dG;
+					// dL_dconic2D[global_id].w += -0.5f * gdy * d.y * dL_dG;
+					dL_dopacity[global_id] += G * dL_dalpha;
+				}
+			}
+
+			// printf ("block %d, %d, thread %d gs_idx %d, means %f, %f, conic %f, %f, %f, opacity %f\n", \
+			// 		block.group_index().x, block.group_index().y, \
+			// 		tid, global_id, \
+			// 		dL_dG * dG_ddelx * ddelx_dx, dL_dG * dG_ddely * ddely_dy, \
+			// 		-0.5f * gdx * d.x * dL_dG, -0.5f * gdx * d.y * dL_dG, -0.5f * gdy * d.y * dL_dG, \
+			// 		G * dL_dalpha);
+
+			/////////////////////
+			/////////////////////
+			/////////////////////
+
+			// dL_dmean2D[global_id].x += dL_dG * dG_ddelx * ddelx_dx;
+			// dL_dmean2D[global_id].y += dL_dG * dG_ddely * ddely_dy;
+
+			// dL_dconic2D[global_id].x += -0.5f * gdx * d.x * dL_dG;
+			// dL_dconic2D[global_id].y += -0.5f * gdx * d.y * dL_dG;
+			// dL_dconic2D[global_id].w += -0.5f * gdy * d.y * dL_dG;
+			// dL_dopacity[global_id] += G * dL_dalpha;
+
+			//////////////////////////////////////////////////////////////////////////////////////
+			// dL_dmean2D_shared[tid].x = skip ? 0.f : dL_dG * dG_ddelx * ddelx_dx;
+			// dL_dmean2D_shared[tid].y = skip ? 0.f : dL_dG * dG_ddely * ddely_dy;
+			// dL_dconic2D_shared[tid].x = skip ? 0.f : -0.5f * gdx * d.x * dL_dG;
+			// dL_dconic2D_shared[tid].y = skip ? 0.f : -0.5f * gdx * d.y * dL_dG;
+			// dL_dconic2D_shared[tid].w = skip ? 0.f : -0.5f * gdy * d.y * dL_dG;
+			// dL_dopacity_shared[tid] = skip ? 0.f : G * dL_dalpha;
+
+			// render_cuda_reduce_sum(block,
+			// 	dL_dmean2D_shared,
+			// 	dL_dconic2D_shared,
+			// 	dL_dopacity_shared,
+			// 	dL_dcolors_shared,
+			// 	dL_ddepths_shared
+			// );
+
+			// if (tid == 0) {
+			// 	float2 dL_dmean2D_acc = dL_dmean2D_shared[0];
+			// 	float4 dL_dconic2D_acc = dL_dconic2D_shared[0];
+			// 	float dL_dopacity_acc = dL_dopacity_shared[0];
+			// 	float3 dL_dcolors_acc = dL_dcolors_shared[0];
+			// 	float dL_ddepths_acc = dL_ddepths_shared[0];
+
+			// 	atomicAdd(&dL_dmean2D[global_id].x, dL_dmean2D_acc.x);
+			// 	atomicAdd(&dL_dmean2D[global_id].y, dL_dmean2D_acc.y);
+			// 	atomicAdd(&dL_dconic2D[global_id].x, dL_dconic2D_acc.x);
+			// 	atomicAdd(&dL_dconic2D[global_id].y, dL_dconic2D_acc.y);
+			// 	atomicAdd(&dL_dconic2D[global_id].w, dL_dconic2D_acc.w);
+			// 	atomicAdd(&dL_dopacity[global_id], dL_dopacity_acc);
+			// 	atomicAdd(&dL_dcolors[global_id * C + 0], dL_dcolors_acc.x);
+			// 	atomicAdd(&dL_dcolors[global_id * C + 1], dL_dcolors_acc.y);
+			// 	atomicAdd(&dL_dcolors[global_id * C + 2], dL_dcolors_acc.z);
+			// 	atomicAdd(&dL_ddepths[global_id], dL_ddepths_acc);
+
+				// dL_dmean2D[global_id].x += dL_dmean2D_acc.x;
+				// dL_dmean2D[global_id].y += dL_dmean2D_acc.y;
+				// dL_dconic2D[global_id].x += dL_dconic2D_acc.x;
+				// dL_dconic2D[global_id].y += dL_dconic2D_acc.y;
+				// dL_dconic2D[global_id].w += dL_dconic2D_acc.w;
+				// dL_dopacity[global_id] += dL_dopacity_acc;
+				// dL_dcolors[global_id * C + 0] += dL_dcolors_acc.x;
+				// dL_dcolors[global_id * C + 1] += dL_dcolors_acc.y;
+				// dL_dcolors[global_id * C + 2] += dL_dcolors_acc.z;
+				// dL_ddepths[global_id] += dL_ddepths_acc;
+			// }
+		}
+	}
+	// printf ("block %d, %d, thread %d, processed %d, skipped %d\n", block.group_index().x, block.group_index().y, tid, processed, skipped);
+}
+
+#else
+
+// Backward version of the rendering procedure.
+template <uint32_t C>
+__global__ void __launch_bounds__(BLOCK_X * BLOCK_Y)
+renderCUDA(
+	const uint2* __restrict__ ranges,
+	const uint32_t* __restrict__ point_list,
+	int W, int H,
+	const float* __restrict__ bg_color,
+	const float2* __restrict__ points_xy_image,
+	const float4* __restrict__ conic_opacity,
+	const float* __restrict__ colors,
+	const float* __restrict__ depths,
+	// const float* __restrict__ lambda,
+	const float* __restrict__ final_Ts,
+	const uint32_t* __restrict__ n_contrib,
+	const float* __restrict__ dL_dpixels,
+	const float* __restrict__ dL_dpixels_depth,
+	float3* __restrict__ dL_dmean2D,
+	float4* __restrict__ dL_dconic2D,
+	float* __restrict__ dL_dopacity,
+	float* __restrict__ dL_dcolors,
+	float* __restrict__ dL_ddepths,
+	bool is_init,
+	int batch
+	// char* render_info
+	)
 {
 	// We rasterize again. Compute necessary block info.
 	auto block = cg::this_thread_block();
@@ -688,6 +1151,70 @@ renderCUDA(
 			const float alpha = min(0.99f, con_o.w * G);
 			skip |= alpha < 1.0f / 255.0f;
 
+
+			// bool my_skip = false;
+
+// #ifdef USE_SAMPLE
+			if ((!is_init) && (con_o.w < 0.95))// && (!skip))// && ((d.x < 5) && (d.y < 5)))
+			{
+				// if (!(std::abs(G - 0.5) < 1e-2))
+				// if (!((alpha > 0.3) && (alpha < 0.5)))
+				// if (alpha > 0.001)
+				// if (alpha > 0.005)
+				// if (alpha > 0.01)
+				// if (alpha > 0.05)
+				// if (alpha < 0.01)
+
+				//////////////////////////////////
+				// if (0)
+				// if (alpha < 0.05)
+				// if (alpha < 0.01)
+				// if (alpha < 0.1)
+				// if (alpha < 0.2)
+				// if (alpha < 0.2 || alpha > 0.1)
+				// if (alpha < 0.3 || alpha > 0.1)
+				// if (alpha > 0.9 || alpha < 0.8)
+				if (alpha < 0.3)
+				// if (alpha < 0.4)
+				// if (alpha < 0.5)
+				// if (alpha < 0.6)
+				// if (alpha < 0.8)
+				// if (alpha < 0.9)
+				// if (!((alpha > 0.005) && (alpha < 0.01)))
+				// if (!((alpha > 0.005) && (alpha < 0.02)))
+				{
+					// skip_aggre = true;
+					skip = true;
+					// my_skip = true;
+				}
+
+				// printf("lambda %f, %f\n", lambda[global_id], lambda[global_id + 1]);
+
+				// float lambda1 = lambda[global_id];
+				// float lambda2 = lambda[global_id + 1];
+				// if (((lambda1 / lambda2) > 2) || ((lambda2 / lambda1) > 2))
+				// {
+				// 	if ((lambda1 > 5) || (lambda2 > 5))
+				// 	{
+				// 		my_skip = false;
+				// 	}
+				// }
+				// if ((con_o.w > 0.95) && (((lambda1 / lambda2) > 10) || ((lambda2 / lambda1) > 10)))
+				// {
+				// 	my_skip = false;
+				// }
+
+				// float max_val = 3.f * sqrt(max(lambda1, lambda2));
+				// float min_val = 3.f * sqrt(min(lambda1, lambda2));
+				// if (((max_val / min_val) > 10) && (con_o.w > 0.9))
+				// if (con_o.w > 0.9)
+				// {
+				// 	my_skip = false;
+				// }
+			}
+// #endif
+
+
 			if (skip) {
 				atomicAdd(&skip_counter, 1);
 			}
@@ -706,6 +1233,12 @@ renderCUDA(
 			float dL_dalpha = 0.0f;
 			const int global_id = collected_id[j];
 			float local_dL_dcolors[3];
+
+			// bool flag = false;
+
+			// if ((con_o.x / con_o.z > 50) || (con_o.z / con_o.x > 50))
+			// 	flag = true;
+
 			#pragma unroll
 			for (int ch = 0; ch < C; ch++)
 			{
@@ -721,6 +1254,14 @@ renderCUDA(
 			dL_dcolors_shared[tid].x = local_dL_dcolors[0];
 			dL_dcolors_shared[tid].y = local_dL_dcolors[1];
 			dL_dcolors_shared[tid].z = local_dL_dcolors[2];
+
+			// if (flag)
+			// {
+			// 	// printf ("hit !!!\n");
+			// 	dL_dcolors_shared[tid].x = 1.0f;
+			// 	dL_dcolors_shared[tid].y = 1.0f;
+			// 	dL_dcolors_shared[tid].z = 1.0f;
+			// }
 
 			const float depth = collected_depths[j];
 			accum_rec_depth = skip ? accum_rec_depth : last_alpha * last_depth + (1.f - last_alpha) * accum_rec_depth;
@@ -742,6 +1283,20 @@ renderCUDA(
 			}
 			dL_dalpha += (-T_final / (1.f - alpha)) * bg_dot_dpixel;
 
+
+
+
+			// if (d.x > 10 || d.y > 10)
+			// 	skip = false;
+			// // if (skip)
+			// if (my_skip)
+			// {
+			// 	dL_ddepths_shared[tid] = 0.f;
+			// 	dL_dcolors_shared[tid].x = 0.f;
+			// 	dL_dcolors_shared[tid].y = 0.f;
+			// 	dL_dcolors_shared[tid].z = 0.f;
+			// }
+
 			// Helpful reusable temporary variables
 			const float dL_dG = con_o.w * dL_dalpha;
 			const float gdx = G * d.x;
@@ -755,6 +1310,21 @@ renderCUDA(
 			dL_dconic2D_shared[tid].y = skip ? 0.f : -0.5f * gdx * d.y * dL_dG;
 			dL_dconic2D_shared[tid].w = skip ? 0.f : -0.5f * gdy * d.y * dL_dG;
 			dL_dopacity_shared[tid] = skip ? 0.f : G * dL_dalpha;
+
+			// if (skip)
+			// if (my_skip)
+			// {
+			// 	dL_dopacity_shared[tid] = 0.f;
+			// 	dL_ddepths_shared[tid] = 0.f;
+			// 	dL_dcolors_shared[tid].x = 0.f;
+			// 	dL_dcolors_shared[tid].y = 0.f;
+			// 	dL_dcolors_shared[tid].z = 0.f;
+			// 	dL_dmean2D_shared[tid].x = 0.f;
+			// 	dL_dmean2D_shared[tid].y = 0.f;
+			// 	dL_dconic2D_shared[tid].x = 0.f;
+			// 	dL_dconic2D_shared[tid].y = 0.f;
+			// 	dL_dconic2D_shared[tid].w = 0.f;
+			// }
 
 			render_cuda_reduce_sum(block,
 				dL_dmean2D_shared,
@@ -771,6 +1341,12 @@ renderCUDA(
 				float3 dL_dcolors_acc = dL_dcolors_shared[0];
 				float dL_ddepths_acc = dL_ddepths_shared[0];
 
+				// if (flag)
+				// {
+				// 	dL_dmean2D_acc.x = 100000;
+				// 	dL_dmean2D_acc.y = 100000;
+				// }
+
 				atomicAdd(&dL_dmean2D[global_id].x, dL_dmean2D_acc.x);
 				atomicAdd(&dL_dmean2D[global_id].y, dL_dmean2D_acc.y);
 				atomicAdd(&dL_dconic2D[global_id].x, dL_dconic2D_acc.x);
@@ -781,10 +1357,44 @@ renderCUDA(
 				atomicAdd(&dL_dcolors[global_id * C + 1], dL_dcolors_acc.y);
 				atomicAdd(&dL_dcolors[global_id * C + 2], dL_dcolors_acc.z);
 				atomicAdd(&dL_ddepths[global_id], dL_ddepths_acc);
+
+
+				// if (!is_init)
+				// 	printf("lambda %f, %f\n", lambda[global_id], lambda[global_id + 1]);
+				// uint32_t tile_idx = block.group_index().y * gridDim.x + block.group_index().x;
+				// if ((tile_idx != 2532) && (tile_idx != 2079))
+				// if (!is_init)
+				// {
+				// 	// if ((tile_idx == 2531) || (tile_idx == 2532) || (tile_idx == 2533))
+				// 	// if (tile_idx == 2532)
+				// 	// if (((tile_idx >= 2529) && (tile_idx <= 2535)) || tile_idx == 2461 || tile_idx==2973)
+				// 	if (
+				// 		((tile_idx >= 2240) && (tile_idx <= 2250)) ||
+				// 		((tile_idx >= 2313) && (tile_idx <= 2323)) ||
+				// 		((tile_idx >= 2386) && (tile_idx <= 2396)) ||
+				// 		((tile_idx >= 2459) && (tile_idx <= 2469)) ||
+				// 		((tile_idx >= 2532) && (tile_idx <= 2542)) ||
+				// 		((tile_idx >= 2605) && (tile_idx <= 2615)) ||
+				// 		((tile_idx >= 2678) && (tile_idx <= 2688)) ||
+				// 		((tile_idx >= 2751) && (tile_idx <= 2761)) ||
+				// 		((tile_idx >= 2824) && (tile_idx <= 2834)) ||
+				// 		((tile_idx >= 2897) && (tile_idx <= 2907)) ||
+				// 		((tile_idx >= 2970) && (tile_idx <= 2980))
+				// 		)
+				// 	{
+				// 		printf("render_info: %s, tile_idx: %d, gs_id: %d, raw_xy: %f, %f, raw_cov: %f, %f, %f, raw_op: %f, raw_depth: %f, raw_color: %f, %f, %f, mx: %f, my: %f, covx: %f, covy: %f, covw: %f, op: %f, cx: %f, cy: %f, cz: %f, dp: %f\n",
+				// 		render_info, tile_idx, global_id, xy.x, xy.y, con_o.x, con_o.y, con_o.z, con_o.w, depth,
+				// 		collected_colors[0 * BLOCK_SIZE + j], collected_colors[1 * BLOCK_SIZE + j], collected_colors[2 * BLOCK_SIZE + j],
+				// 		dL_dmean2D_acc.x, dL_dmean2D_acc.y,
+				// 		dL_dconic2D_acc.x, dL_dconic2D_acc.y, dL_dconic2D_acc.w,
+				// 		dL_dopacity_acc, dL_dcolors_acc.x, dL_dcolors_acc.y, dL_dcolors_acc.z, dL_ddepths_acc);
+				// 	}
+				// }
 			}
 		}
 	}
 }
+#endif
 
 void BACKWARD::preprocess(
 	int P, int D, int M,
@@ -869,6 +1479,7 @@ void BACKWARD::render(
 	const float4* conic_opacity,
 	const float* colors,
 	const float* depths,
+	// const float* lambda,
 	const float* final_Ts,
 	const uint32_t* n_contrib,
 	const float* dL_dpixels,
@@ -877,8 +1488,24 @@ void BACKWARD::render(
 	float4* dL_dconic2D,
 	float* dL_dopacity,
 	float* dL_dcolors,
-	float* dL_ddepths)
+	float* dL_ddepths,
+	bool is_init,
+	const std::string render_info)
 {
+	int num_batches = 1;
+	// if (!is_init)
+	// 	num_batches = 1;
+
+	// const char* render_info_host = render_info.c_str();
+	// char* render_info_device;
+
+	// cudaMalloc((void**)&render_info_device, strlen(render_info_host) + 1);
+	// cudaMemcpy(render_info_device, render_info_host, strlen(render_info_host) + 1, cudaMemcpyHostToDevice);
+
+	// printf("render info before launch: %s\n", render_info.c_str());
+	// printf ("x, y, z: %d, %d, %d\n ", grid.x, grid.y, grid.z); //<< ", " << grid.y << "\n";
+	// printf ("block x, y: %d, %d\n ", block.x, block.y);
+
 	renderCUDA<NUM_CHANNELS> << <grid, block >> >(
 		ranges,
 		point_list,
@@ -896,6 +1523,37 @@ void BACKWARD::render(
 		dL_dconic2D,
 		dL_dopacity,
 		dL_dcolors,
-		dL_ddepths
+		dL_ddepths,
+		is_init,
+		num_batches
+		// render_info_device
 	);
+
+	// for (int batch=0; batch<num_batches; batch++)
+	// {
+	// 	renderCUDA<NUM_CHANNELS> << <grid, block >> >(
+	// 		ranges,
+	// 		point_list,
+	// 		W, H,
+	// 		bg_color,
+	// 		means2D,
+	// 		conic_opacity,
+	// 		colors,
+	// 		depths,
+	// 		// lambda,
+	// 		final_Ts,
+	// 		n_contrib,
+	// 		dL_dpixels,
+	// 		dL_dpixels_depth,
+	// 		dL_dmean2D,
+	// 		dL_dconic2D,
+	// 		dL_dopacity,
+	// 		dL_dcolors,
+	// 		dL_ddepths,
+	// 		is_init,
+	// 		batch,
+	// 		render_info_device
+	// 	);
+	// cudaDeviceSynchronize();
+	// }
 }

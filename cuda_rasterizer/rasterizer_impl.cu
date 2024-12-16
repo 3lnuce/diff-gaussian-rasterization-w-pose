@@ -489,6 +489,7 @@ int CudaRasterizer::Rasterizer::forward_fast(
 	float* out_opacity,
 	int* radii,
 	int* n_touched,
+	// float* out_lambda,
 	bool debug,
 	const int* is_active,
 	int* tile_active)
@@ -554,6 +555,7 @@ int CudaRasterizer::Rasterizer::forward_fast(
 		tile_grid,
 		geomState.tiles_touched,
 		prefiltered
+		// out_lambda=out_lambda
 	), debug)
 
 #ifdef TIMING
@@ -1066,6 +1068,7 @@ void CudaRasterizer::Rasterizer::backward(
     const float* campos,
 	const float tan_fovx, float tan_fovy,
 	const int* radii,
+	// const float* lambda,
 	char* geom_buffer,
 	char* binning_buffer,
 	char* img_buffer,
@@ -1082,8 +1085,11 @@ void CudaRasterizer::Rasterizer::backward(
 	float* dL_dscale,
 	float* dL_drot,
 	float* dL_dtau,
-	bool debug)
+	bool debug,
+	bool is_init,
+	const std::string render_info)
 {
+	// printf("imple: %s\n", render_info.c_str());
 	GeometryState geomState = GeometryState::fromChunk(geom_buffer, P);
 	BinningState binningState = BinningState::fromChunk(binning_buffer, R);
 	ImageState imgState = ImageState::fromChunk(img_buffer, width * height);
@@ -1116,6 +1122,7 @@ void CudaRasterizer::Rasterizer::backward(
 		geomState.conic_opacity,
 		color_ptr,
 		depth_ptr,
+		// lambda,
 		imgState.accum_alpha,
 		imgState.n_contrib,
 		dL_dpix,
@@ -1124,7 +1131,9 @@ void CudaRasterizer::Rasterizer::backward(
 		(float4*)dL_dconic,
 		dL_dopacity,
 		dL_dcolor,
-		dL_ddepth
+		dL_ddepth,
+		is_init,
+		render_info
     ), debug)
 
 	// Take care of the rest of preprocessing. Was the precomputed covariance

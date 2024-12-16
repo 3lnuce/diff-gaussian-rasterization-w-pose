@@ -32,6 +32,7 @@ std::function<char*(size_t N)> resizeFunctional(torch::Tensor& t) {
     return lambda;
 }
 
+// std::tuple<int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 std::tuple<int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 RasterizeGaussiansCUDA(
 	const torch::Tensor& background,
@@ -81,6 +82,8 @@ RasterizeGaussiansCUDA(
   std::function<char*(size_t)> binningFunc = resizeFunctional(binningBuffer);
   std::function<char*(size_t)> imgFunc = resizeFunctional(imgBuffer);
 
+//   torch::Tensor out_lambda = torch::full({P * 2}, 0, float_opts);
+
   int rendered = 0;
   if(P != 0)
   {
@@ -120,9 +123,11 @@ RasterizeGaussiansCUDA(
 		n_touched.contiguous().data<int>(),
 		debug);
   }
+//   return std::make_tuple(rendered, out_color, radii, geomBuffer, binningBuffer, imgBuffer, out_depth, out_opaticy, n_touched, out_lambda);
   return std::make_tuple(rendered, out_color, radii, geomBuffer, binningBuffer, imgBuffer, out_depth, out_opaticy, n_touched);
 }
 
+// std::tuple<int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 std::tuple<int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 RasterizeGaussiansCUDAFast(
 	const torch::Tensor& background,
@@ -177,6 +182,8 @@ RasterizeGaussiansCUDAFast(
   uint32_t vert_blocks = (H + BLOCK_Y - 1) / BLOCK_Y;
   torch::Tensor tile_active = torch::full({hori_blocks * vert_blocks}, 0, means3D.options().dtype(torch::kInt32));
 
+//   torch::Tensor out_lambda = torch::full({P * 2}, 0, float_opts);
+
   int rendered = 0;
   if(P != 0)
   {
@@ -212,10 +219,12 @@ RasterizeGaussiansCUDAFast(
 		out_opaticy.contiguous().data<float>(),
 		radii.contiguous().data<int>(),
 		n_touched.contiguous().data<int>(),
+		// out_lambda.contiguous().data<float>(),
 		debug,
 		is_active.contiguous().data<int>(),
 		tile_active.contiguous().data<int>());
   }
+//   return std::make_tuple(rendered, out_color, radii, geomBuffer, binningBuffer, imgBuffer, out_depth, out_opaticy, n_touched, out_lambda);
   return std::make_tuple(rendered, out_color, radii, geomBuffer, binningBuffer, imgBuffer, out_depth, out_opaticy, n_touched);
 }
 
@@ -375,7 +384,10 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
 	const int R,
 	const torch::Tensor& binningBuffer,
 	const torch::Tensor& imageBuffer,
-	const bool debug)
+	// const torch::Tensor& lambda,
+	const bool debug,
+	const bool is_init,
+	const std::string render_info)
 {
   const int P = means3D.size(0);
   const int H = dL_dout_color.size(1);
@@ -418,6 +430,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
 	  tan_fovx,
 	  tan_fovy,
 	  radii.contiguous().data<int>(),
+	//   lambda.contiguous().data<float>(),
 	  reinterpret_cast<char*>(geomBuffer.contiguous().data_ptr()),
 	  reinterpret_cast<char*>(binningBuffer.contiguous().data_ptr()),
 	  reinterpret_cast<char*>(imageBuffer.contiguous().data_ptr()),
@@ -434,7 +447,9 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
 	  dL_dscales.contiguous().data<float>(),
 	  dL_drotations.contiguous().data<float>(),
       dL_dtau.contiguous().data<float>(),
-	  debug);
+	  debug,
+	  is_init,
+	  render_info);
   }
 
   return std::make_tuple(dL_dmeans2D, dL_dcolors, dL_dopacity, dL_dmeans3D, dL_dcov3D, dL_dsh, dL_dscales, dL_drotations, dL_dtau);

@@ -80,6 +80,7 @@ namespace CudaRasterizer
 			float* out_opacity,
 			int* radii = nullptr,
 			int* n_touched = nullptr,
+			// float* out_lambda = nullptr,
 			bool debug = false,
 			const int* is_active = nullptr,
 			int* tile_active = nullptr);
@@ -145,6 +146,7 @@ namespace CudaRasterizer
             const float* campos,
 			const float tan_fovx, float tan_fovy,
 			const int* radii,
+			// const float* lambda,
 			char* geom_buffer,
 			char* binning_buffer,
 			char* image_buffer,
@@ -161,7 +163,9 @@ namespace CudaRasterizer
 			float* dL_dscale,
 			float* dL_drot,
 			float* dL_dtau,
-			bool debug);
+			bool debug,
+			bool is_init,
+			const std::string render_info);
 	};
 };
 
